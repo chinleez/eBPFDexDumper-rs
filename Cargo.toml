@@ -1,6 +1,6 @@
 [package]
 name = "ebpf-dex-dumper-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Android eBPF DEX dumper and repair utilities"
 repository = "https://github.com/chinleez/eBPFDexDumper-rs"
