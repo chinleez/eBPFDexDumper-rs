@@ -26,6 +26,17 @@ pub struct ArtRuntimeLayout {
 }
 
 impl ArtRuntimeLayout {
+    /// AOSP main-line ART layout for Android 13–17 ARM64 ROMs.
+    ///
+    /// The BPF program assumes `mirror::Class::dex_cache_` and
+    /// `ArtMethod::declaring_class_` are 32-bit `HeapReference` /
+    /// `GcRoot<Class>` (compressed references), which is the AOSP default on
+    /// 64-bit Android. Vendor ROMs that disable compressed references (rare
+    /// on phones, occasionally seen in emulators / desktop ART builds) need
+    /// to override the layout via `--art-layout` and adjust the `class_*` /
+    /// `dex_cache_*` offsets accordingly. The other offsets (DexFile,
+    /// DexHeader, CodeItem) are dictated by the DEX format itself and are
+    /// version-stable.
     pub const fn android_13_plus_default() -> Self {
         Self {
             shadow_frame_method_offset: 0x08,
@@ -97,6 +108,7 @@ pub struct ArtHookTargets {
     pub execute_nterp_with_clinit: Option<ResolvedTarget>,
     pub verify_class: Option<ResolvedTarget>,
     pub dex_file_ctor: Option<ResolvedTarget>,
+    pub register_dex_file: Option<ResolvedTarget>,
     pub nterp_invoke_addrs: Vec<ResolvedTarget>,
 }
 
@@ -181,22 +193,10 @@ fn find_art_offsets_inner(
         }
         if targets.dex_file_ctor.is_none() && is_art_dex_file_constructor_symbol(&name) {
             targets.dex_file_ctor = Some(ResolvedTarget::new(value, TargetSource::Symbol));
+            continue;
         }
-    }
-
-    if targets.execute.is_none() {
-        match find_execute_by_interpreting_string(&elf, &bytes, quiet) {
-            Ok(addr) => {
-                targets.execute = Some(ResolvedTarget::new(addr, TargetSource::StringRef));
-                log_resolve(
-                    quiet,
-                    format_args!("[+] Execute found by 'Interpreting ' string at 0x{addr:x}"),
-                );
-            }
-            Err(err) => log_resolve(
-                quiet,
-                format_args!("[-] Execute not found by symbol or string reference: {err:#}"),
-            ),
+        if targets.register_dex_file.is_none() && is_art_register_dex_file_symbol(&name) {
+            targets.register_dex_file = Some(ResolvedTarget::new(value, TargetSource::Symbol));
         }
     }
 
@@ -233,6 +233,7 @@ fn find_art_offsets_inner(
 
     if targets.execute_nterp_with_clinit.is_none() {
         let mut found = None;
+        let mut diagnostics: Vec<String> = Vec::new();
         if let Some(execute_nterp) = targets.execute_nterp {
             match find_nterp_with_clinit_by_branch(&elf, &bytes, execute_nterp.addr) {
                 Ok(addrs) if !addrs.is_empty() => {
@@ -252,14 +253,8 @@ fn find_art_offsets_inner(
                         );
                     }
                 }
-                Ok(_) => log_resolve(
-                    quiet,
-                    format_args!("[-] ExecuteNterpWithClinitImpl not found by branch scan"),
-                ),
-                Err(err) => log_resolve(
-                    quiet,
-                    format_args!("[-] ExecuteNterpWithClinitImpl branch scan failed: {err:#}"),
-                ),
+                Ok(_) => diagnostics.push("branch scan no match".to_string()),
+                Err(err) => diagnostics.push(format!("branch scan: {err:#}")),
             }
         }
         if found.is_none() {
@@ -281,33 +276,96 @@ fn find_art_offsets_inner(
                         );
                     }
                 }
-                Ok(_) => log_resolve(
-                    quiet,
-                    format_args!("[-] ExecuteNterpWithClinitImpl not found by signature"),
-                ),
-                Err(err) => log_resolve(
-                    quiet,
-                    format_args!("[-] ExecuteNterpWithClinitImpl signature scan failed: {err:#}"),
-                ),
+                Ok(_) => diagnostics.push("signature no match".to_string()),
+                Err(err) => diagnostics.push(format!("signature: {err:#}")),
             }
         }
         if let Some(addr) = found {
             targets.execute_nterp_with_clinit =
                 Some(ResolvedTarget::new(addr, TargetSource::Pattern));
+        } else {
+            // Android 13 ART has no separate ExecuteNterpWithClinitImpl variant; the
+            // clinit barrier is handled inside ExecuteNterpImpl. This is expected on
+            // older ROMs and not an error as long as ExecuteNterpImpl is attached.
+            let tag = if targets.execute_nterp.is_some() {
+                "[!]"
+            } else {
+                "[-]"
+            };
+            let detail = if diagnostics.is_empty() {
+                "no candidate".to_string()
+            } else {
+                diagnostics.join("; ")
+            };
+            log_resolve(
+                quiet,
+                format_args!(
+                    "{tag} ExecuteNterpWithClinitImpl not located (likely Android 13 or fully inlined): {detail}"
+                ),
+            );
         }
     }
 
-    match find_pattern_uaddrs(&elf, &bytes, NTERP_OP_INVOKE_SIG) {
-        Ok(addrs) => {
-            targets.nterp_invoke_addrs = addrs
+    if targets.execute.is_none() {
+        match find_execute_by_interpreting_string(&elf, &bytes, quiet) {
+            Ok(addr) => {
+                targets.execute = Some(ResolvedTarget::new(addr, TargetSource::StringRef));
+                log_resolve(
+                    quiet,
+                    format_args!("[+] Execute found by 'Interpreting ' string at 0x{addr:x}"),
+                );
+            }
+            Err(err) => {
+                // Android 15+ ROMs strip and inline art::interpreter::Execute into the
+                // nterp main entries; treat the miss as informational once nterp is up.
+                let tag = if targets.execute_nterp.is_some()
+                    || targets.execute_nterp_with_clinit.is_some()
+                {
+                    "[!]"
+                } else {
+                    "[-]"
+                };
+                log_resolve(
+                    quiet,
+                    format_args!(
+                        "{tag} art::interpreter::Execute not located; nterp covers main path: {err:#}"
+                    ),
+                );
+            }
+        }
+    }
+
+    {
+        let mut all = BTreeSet::new();
+        let mut last_err: Option<anyhow::Error> = None;
+        for sig in NTERP_OP_INVOKE_SIGS {
+            match find_pattern_uaddrs(&elf, &bytes, sig) {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        all.insert(addr);
+                    }
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        if all.is_empty() {
+            if let Some(err) = last_err {
+                log_resolve(
+                    quiet,
+                    format_args!("[-] nterp_op_invoke_* pattern not found: {err:#}"),
+                );
+            } else {
+                log_resolve(
+                    quiet,
+                    format_args!("[-] nterp_op_invoke_* pattern not found"),
+                );
+            }
+        } else {
+            targets.nterp_invoke_addrs = all
                 .into_iter()
                 .map(|addr| ResolvedTarget::new(addr, TargetSource::Pattern))
                 .collect();
         }
-        Err(err) => log_resolve(
-            quiet,
-            format_args!("[-] nterp_op_invoke_* pattern not found: {err:#}"),
-        ),
     }
 
     if !targets.has_main_entry() {
@@ -373,13 +431,51 @@ fn is_target_art_symbol(name: &str) -> bool {
             && name.contains("13ClassVerifier")
             && name.contains("11VerifyClass"))
         || is_art_dex_file_constructor_symbol(name)
+        || is_art_register_dex_file_symbol(name)
+}
+
+fn is_art_register_dex_file_symbol(name: &str) -> bool {
+    // ClassLinker has multiple RegisterDexFile overloads across versions:
+    //   * RegisterDexFile(DexFile const&, ObjPtr<ClassLoader>)   <- mangled tail "ERKNS_7DexFile..."
+    //   * RegisterDexFile(unique_ptr<DexFile const, ...>, ...)   <- mangled tail "EONSt3__1..." or similar
+    // Only the first form passes a raw DexFile* in x1, which is the ABI the
+    // uprobe_libart_registerDexFile BPF program assumes. Pin the suffix so we
+    // don't accidentally attach to an overload whose x1 is something else.
+    name.starts_with("_ZN3art11ClassLinker15RegisterDexFileERKNS_7DexFile")
 }
 
 fn is_art_dex_file_constructor_symbol(name: &str) -> bool {
-    name.starts_with("_ZN3art7DexFileC1") || name.starts_with("_ZN3art7DexFileC2")
+    // Direct DexFile ctors (most Android 13–15 ROMs):
+    //   ABI x0=this(DexFile*), x1=base(uint8_t const*), x2=size(size_t).
+    // uprobe_libart_dexFileCtor reads x1 as the dex begin pointer.
+    if name.starts_with("_ZN3art7DexFileC1") || name.starts_with("_ZN3art7DexFileC2") {
+        return true;
+    }
+    // Android 16/17 strip and inline the DexFile ctor entirely. DexFileLoader::OpenOne
+    //   OpenOne(uintptr_t base, uint32_t size, OatDexFile const*, bool, bool, std::string*)
+    //   ABI x0=this(DexFileLoader*), x1=base, x2=size — same x1=base shape as the ctor,
+    // so the same uprobe_libart_dexFileCtor program works.
+    // NOTE: on most stripped libart this symbol exists in dynsym with st_value=0
+    // (treated as an import placeholder); attach simply skips it. When a ROM
+    // does export it with a real address, the ABI assumption above holds.
+    if name.starts_with("_ZN3art13DexFileLoader7OpenOne") {
+        return true;
+    }
+    false
 }
 
-pub const NTERP_OP_INVOKE_SIG: &[u8] = &[0x03, 0x0c, 0x40, 0xf9, 0x5f, 0x00, 0x03, 0xeb];
+// Multiple nterp_op_invoke_* signatures. The dumper attaches uprobes to every
+// match across all patterns, so adding a candidate only ever broadens coverage.
+//   1. Android 13–15 invoke handler prologue (load+cmp on v-table-ish slot).
+//   2. Android 16/17 invoke-virtual/super/direct/static prologue: load class +
+//      fetch dex_method_index from the invoke instruction (`ubfx`-free path).
+pub const NTERP_OP_INVOKE_SIGS: &[&[u8]] = &[
+    &[0x03, 0x0c, 0x40, 0xf9, 0x5f, 0x00, 0x03, 0xeb],
+    &[
+        0xc3, 0x06, 0xc0, 0x79, 0xe9, 0x7e, 0x08, 0x53, 0x62, 0x1c, 0x00, 0x12, 0xa0, 0x5b, 0x62,
+        0xb8,
+    ],
+];
 
 const EXECUTE_NTERP_IMPL_SIG: &[u8] = &[
     0xf0, 0x0b, 0x40, 0xd1, 0x1f, 0x02, 0x40, 0xb9, 0xff, 0x83, 0x02, 0xd1, 0xe8, 0x27, 0x00, 0x6d,

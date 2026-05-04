@@ -32,6 +32,10 @@ struct DumpArgs {
     #[arg(short, long)]
     uid: Option<u32>,
 
+    /// Optional pid filter applied in addition to --uid.
+    #[arg(short = 'p', long)]
+    pid: Option<u32>,
+
     /// Android package name used to derive UID.
     #[arg(short, long)]
     name: Option<String>,
@@ -139,6 +143,7 @@ struct OffsetsJson {
     execute_nterp_with_clinit_impl: Option<art::ResolvedTarget>,
     verify_class: Option<art::ResolvedTarget>,
     dex_file_ctor: Option<art::ResolvedTarget>,
+    register_dex_file: Option<art::ResolvedTarget>,
     nterp_op_invoke: Vec<art::ResolvedTarget>,
     runtime_layout: art::ArtRuntimeLayout,
     android_16_notes: &'static str,
@@ -175,6 +180,7 @@ fn main() -> Result<()> {
                         execute_nterp_with_clinit_impl: targets.execute_nterp_with_clinit,
                         verify_class: targets.verify_class,
                         dex_file_ctor: targets.dex_file_ctor,
+                        register_dex_file: targets.register_dex_file,
                         nterp_op_invoke: targets.nterp_invoke_addrs,
                         runtime_layout,
                         android_16_notes: "android16-release keeps arm64 ExecuteNterpWithClinitImpl branching into ExecuteNterpImpl and ArtMethod::data_ as runtime CodeItem*",
@@ -190,6 +196,7 @@ fn main() -> Result<()> {
                 );
                 print_target("VerifyClass", targets.verify_class);
                 print_target("DexFile::DexFile", targets.dex_file_ctor);
+                print_target("ClassLinker::RegisterDexFile", targets.register_dex_file);
                 println!(
                     "nterp_op_invoke_*: {} target(s)",
                     targets.nterp_invoke_addrs.len()
@@ -221,6 +228,7 @@ fn main() -> Result<()> {
 
             let config = dump::DumpConfig {
                 uid,
+                pid: args.pid,
                 package_name: args.name,
                 libart: args.libart,
                 out: args.out,

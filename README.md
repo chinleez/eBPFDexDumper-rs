@@ -154,21 +154,10 @@ su -c './eBPFDexDumper dump -n com.example.app --no-clean-oat --no-auto-fix'
   native buffer scan 会尝试从 `mmap`/`mprotect`/`memcpy`/`memmove` 的候选缓冲区中
   识别完整 DEX；如果壳只生成碎片化方法体，仍需要按壳定点 hook 解密函数。
 
-因此本项目默认使用“ART 入口 + DexFile 构造 + CodeItem 反扫 + maps 扫描 +
-native buffer 扫描”的组合；更深的函数级解密点仍属于按壳适配。
+## 方案说明
 
-## 五层方案 Review
-
-1. ART fast path：稳定性最好，依赖字段布局；当前通过 ELF/source pattern 自动解析，
-   失败时可用 `--art-layout` 兜底。
-2. DexFile 构造：覆盖 `InMemoryDexClassLoader` 等先构造 ART `DexFile` 的路径；缺点是
-   stripped ROM 上构造函数符号可能不存在，缺失时自动跳过。
-3. CodeItem 反扫：能绕开 `Class/DexCache` 布局变化，适合 Android 13+ nterp；缺点是只在
-   方法执行后触发，未执行类不会被它发现。
-4. maps 扫描：不依赖 ART 符号，能补启动前已加载 DEX；缺点是一次性扫描有开销，默认限制
-   单 region 512MB，可用 `--no-maps-scan` 关闭。
-5. native buffer 扫描：更贴近自定义 native loader，能抓到交给 ART 前的连续 DEX 缓冲区；
-   缺点是 `memcpy/memmove` 调用频繁且只能识别完整 DEX，碎片化 class 抽取仍要定点适配。
+默认组合覆盖 ART 入口、DexFile 注册/构造、CodeItem 反扫、maps 扫描和 native buffer 扫描。
+ART 字段布局默认按 Android 13+ 常见布局处理，ROM 偏移不一致时可用 `--art-layout` 指定。
 
 ## 常见日志
 

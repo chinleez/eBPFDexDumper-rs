@@ -105,15 +105,19 @@ pub fn apply_records_to_dex(
             }
         };
         let write_len = expected_len.min(code_bytes.len());
-        if code_off + 0x10 + write_len > dex_bytes.len() {
+        let insns_start = code_off + 0x10;
+        let insns_end = insns_start.saturating_add(expected_len);
+        if insns_end > dex_bytes.len() {
             stats.skipped += 1;
             continue;
         }
         if write_len != code_bytes.len() || write_len != expected_len {
             stats.length_mismatch += 1;
         }
-        dex_bytes[code_off + 0x10..code_off + 0x10 + write_len]
-            .copy_from_slice(&code_bytes[..write_len]);
+        dex_bytes[insns_start..insns_start + write_len].copy_from_slice(&code_bytes[..write_len]);
+        if write_len < expected_len {
+            dex_bytes[insns_start + write_len..insns_end].fill(0);
+        }
         stats.applied += 1;
     }
     Ok(stats)

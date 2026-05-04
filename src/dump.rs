@@ -3,6 +3,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug)]
 pub struct DumpConfig {
     pub uid: u32,
+    pub pid: Option<u32>,
     pub package_name: Option<String>,
     pub libart: PathBuf,
     pub out: PathBuf,
@@ -23,7 +24,7 @@ mod imp {
     use super::DumpConfig;
     use crate::{art, dex::DexParser, fix};
     use anyhow::{Context, Result};
-    use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, MapData, RingBuf};
+    use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
     use aya::programs::{ProgramError, UProbe};
     use aya::{include_bytes_aligned, Btf, EbpfLoader, Pod};
     use object::Endianness;
@@ -55,7 +56,11 @@ mod imp {
     const MAPS_SCAN_MAX_REGION: u64 = 512 * 1024 * 1024;
     const NATIVE_BUFFER_SCAN_LIMIT: u64 = 64 * 1024 * 1024;
     const NATIVE_BUFFER_SCAN_STEP: u64 = 0x1000;
-    static RUNNING: AtomicBool = AtomicBool::new(true);
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+
+    fn keep_running() -> bool {
+        RUNNING.load(Ordering::Relaxed)
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
@@ -296,13 +301,25 @@ mod imp {
         }
 
         fn save_dex(&self, begin: u64, size: u32, bytes: Vec<u8>) {
-            if self.dex_cache.read().unwrap().contains_key(&begin) {
-                return;
+            {
+                let mut cache = self.dex_cache.write().unwrap();
+                if cache.contains_key(&begin) {
+                    return;
+                }
+                if let Err(err) = DexParser::new(&bytes) {
+                    // Skip writing malformed dex so the fix stage stays clean
+                    // and we don't leave half-truncated files on disk.
+                    eprintln!(
+                        "Skip malformed dex 0x{begin:x} ({} bytes): {err}",
+                        bytes.len()
+                    );
+                    return;
+                }
+                // Drop any half-assembled chunks for this dex; another path
+                // just landed a complete, valid copy.
+                self.pending_dex.write().unwrap().remove(&begin);
+                cache.insert(begin, bytes.clone());
             }
-            if let Err(err) = DexParser::new(&bytes) {
-                eprintln!("Failed to parse dumped dex 0x{begin:x}: {err}");
-            }
-            self.dex_cache.write().unwrap().insert(begin, bytes.clone());
             self.dex_sizes.write().unwrap().insert(begin, size);
 
             let file_name = self.output_dir.join(format!("dex_{begin:x}_{size:x}.dex"));
@@ -381,17 +398,30 @@ mod imp {
 
         fn scan_uid_maps_once(&self, uid: u32) {
             match scan_uid_maps(uid) {
-                Ok(found) => {
-                    for (begin, size, bytes) in found {
-                        self.save_dex(begin, size, bytes);
-                    }
-                }
+                Ok(found) => self.save_scanned_dexes(found),
                 Err(err) => {
                     if self.trace {
                         eprintln!("maps scan skipped: {err:#}");
                     }
                 }
             }
+        }
+
+        fn save_scanned_dexes(&self, dexes: Vec<(u64, u32, Vec<u8>)>) {
+            for (begin, size, bytes) in dexes {
+                self.save_dex(begin, size, bytes);
+            }
+        }
+
+        fn spawn_maps_scan(self: &Arc<Self>, uid: u32, pid: Option<u32>) -> thread::JoinHandle<()> {
+            let state = Arc::clone(self);
+            thread::spawn(move || match pid {
+                Some(pid) => match scan_process_maps(pid) {
+                    Ok(dexes) => state.save_scanned_dexes(dexes),
+                    Err(err) => eprintln!("maps scan failed for pid {pid}: {err:#}"),
+                },
+                None => state.scan_uid_maps_once(uid),
+            })
         }
     }
 
@@ -416,6 +446,7 @@ mod imp {
         );
         print_target("VerifyClass", targets.verify_class);
         print_target("DexFile::DexFile", targets.dex_file_ctor);
+        print_target("ClassLinker::RegisterDexFile", targets.register_dex_file);
         println!(
             "[+] nterp_op_invoke_* pattern targets: {}",
             targets.nterp_invoke_addrs.len()
@@ -463,7 +494,7 @@ mod imp {
             0,
             BpfConfig {
                 uid: config.uid,
-                pid: 0,
+                pid: config.pid.map(|p| p as i32).unwrap_or(-1),
                 code_item_fallback: u32::from(config.code_item_fallback),
                 debug_layout: u32::from(config.debug_layout),
                 native_buffer_scan: u32::from(config.native_buffer_scan),
@@ -471,16 +502,17 @@ mod imp {
             },
             0,
         )?;
-        let mut layout_map: AyaArray<&mut MapData, art::ArtRuntimeLayout> = AyaArray::try_from(
-            ebpf.map_mut("art_layout_map")
-                .context("art_layout_map not found")?,
-        )?;
-        layout_map.set(0, runtime_layout, 0)?;
+        let mut layout_map: AyaHashMap<&mut MapData, u32, art::ArtRuntimeLayout> =
+            AyaHashMap::try_from(
+                ebpf.map_mut("art_layout_map")
+                    .context("art_layout_map not found")?,
+            )?;
+        layout_map.insert(0, runtime_layout, 0)?;
         println!("[+] Filtering on uid {}", config.uid);
 
         let mut attached_main = 0usize;
         if let Some(target) = targets.execute {
-            attach_uprobe(
+            attach_probe(
                 &mut ebpf,
                 "uprobe_libart_execute",
                 &config.libart,
@@ -490,7 +522,7 @@ mod imp {
             attached_main += 1;
         }
         if let Some(target) = targets.execute_nterp {
-            attach_uprobe(
+            attach_probe(
                 &mut ebpf,
                 "uprobe_libart_executeNterpImpl",
                 &config.libart,
@@ -500,7 +532,7 @@ mod imp {
             attached_main += 1;
         }
         if let Some(target) = targets.execute_nterp_with_clinit {
-            attach_uprobe(
+            attach_probe(
                 &mut ebpf,
                 "uprobe_libart_executeNterpImpl",
                 &config.libart,
@@ -514,7 +546,7 @@ mod imp {
         }
 
         for target in targets.nterp_invoke_addrs {
-            if let Err(err) = attach_uprobe(
+            if let Err(err) = attach_probe(
                 &mut ebpf,
                 "uprobe_libart_nterpOpInvoke",
                 &config.libart,
@@ -527,7 +559,7 @@ mod imp {
             }
         }
         if let Some(target) = targets.dex_file_ctor {
-            if let Err(err) = attach_uprobe(
+            if let Err(err) = attach_probe(
                 &mut ebpf,
                 "uprobe_libart_dexFileCtor",
                 &config.libart,
@@ -535,6 +567,19 @@ mod imp {
             ) {
                 eprintln!(
                     "[-] failed to attach DexFile::DexFile at 0x{:x}: {err:#}",
+                    target.addr
+                );
+            }
+        }
+        if let Some(target) = targets.register_dex_file {
+            if let Err(err) = attach_probe(
+                &mut ebpf,
+                "uprobe_libart_registerDexFile",
+                &config.libart,
+                target.addr,
+            ) {
+                eprintln!(
+                    "[-] failed to attach RegisterDexFile at 0x{:x}: {err:#}",
                     target.addr
                 );
             }
@@ -547,12 +592,15 @@ mod imp {
             }
         }
 
-        let state = Arc::new(DumpState::new(config.out.clone(), config.trace));
-        if config.maps_scan {
-            state.scan_uid_maps_once(config.uid);
-        }
         RUNNING.store(true, Ordering::SeqCst);
         install_signal_handlers();
+
+        let state = Arc::new(DumpState::new(config.out.clone(), config.trace));
+        let maps_scan_thread = if config.maps_scan {
+            Some(state.spawn_maps_scan(config.uid, config.pid))
+        } else {
+            None
+        };
 
         let mut events =
             RingBuf::try_from(ebpf.take_map("events").context("events map not found")?)?;
@@ -591,6 +639,11 @@ mod imp {
             });
             thread::sleep(Duration::from_millis(50));
         }
+        if let Some(handle) = maps_scan_thread {
+            if handle.join().is_err() {
+                eprintln!("[!] maps scan thread panicked");
+            }
+        }
 
         println!("Stopping eBPF DexDumper");
         drain_ring(&mut events, |data| state.handle_dex_event(data));
@@ -614,25 +667,7 @@ mod imp {
         Ok(())
     }
 
-    fn attach_uprobe(
-        ebpf: &mut aya::Ebpf,
-        program_name: &str,
-        target: &std::path::Path,
-        offset: u64,
-    ) -> Result<()> {
-        let program: &mut UProbe = ebpf
-            .program_mut(program_name)
-            .with_context(|| format!("{program_name} not found"))?
-            .try_into()?;
-        match program.load() {
-            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-            Err(err) => return Err(err.into()),
-        }
-        program.attach(None, offset, target, None)?;
-        Ok(())
-    }
-
-    fn attach_uretprobe(
+    fn attach_probe(
         ebpf: &mut aya::Ebpf,
         program_name: &str,
         target: &std::path::Path,
@@ -671,7 +706,7 @@ mod imp {
             let Some(offset) = find_elf_symbol(libc_path, symbol) else {
                 continue;
             };
-            let entry_result = attach_uprobe(ebpf, entry_program, libc_path, offset);
+            let entry_result = attach_probe(ebpf, entry_program, libc_path, offset);
             match entry_result {
                 Ok(()) => attached += 1,
                 Err(err) => {
@@ -682,7 +717,7 @@ mod imp {
                 }
             }
             if let Some(ret_program) = ret_program {
-                if let Err(err) = attach_uretprobe(ebpf, ret_program, libc_path, offset) {
+                if let Err(err) = attach_probe(ebpf, ret_program, libc_path, offset) {
                     eprintln!(
                         "[-] failed to attach native retprobe {ret_program}:{symbol} at 0x{offset:x}: {err:#}"
                     );
@@ -955,22 +990,26 @@ mod imp {
             let mut off = 0usize;
             while let Some(idx) = find_subslice(&page[off..], b"dex\n") {
                 let begin = scan + (off + idx) as u64;
-                if begin > code_item_ptr || begin + DEX_HEADER_SIZE as u64 <= code_item_ptr {
+                if begin > code_item_ptr {
                     off += idx + 4;
                     if off >= page.len() {
                         break;
                     }
                     continue;
                 }
-                if let Ok(header) = read_remote_mem(pid, begin, DEX_HEADER_SIZE) {
-                    if let Some(size) = validate_dex_header_contains(&header, begin, code_item_ptr)
-                    {
-                        let bytes = read_remote_mem(pid, begin, size).with_context(|| {
-                            format!("read dex from 0x{begin:x}, size 0x{size:x}")
-                        })?;
-                        if DexParser::new(&bytes).is_ok() {
-                            return Ok(Some((begin, size, bytes)));
-                        }
+                let page_off = off + idx;
+                let header_in_page = page.get(page_off..page_off + DEX_HEADER_SIZE as usize);
+                let validated = match header_in_page {
+                    Some(header) => validate_dex_header_contains(header, begin, code_item_ptr),
+                    None => read_remote_mem(pid, begin, DEX_HEADER_SIZE)
+                        .ok()
+                        .and_then(|h| validate_dex_header_contains(&h, begin, code_item_ptr)),
+                };
+                if let Some(size) = validated {
+                    let bytes = read_remote_mem(pid, begin, size)
+                        .with_context(|| format!("read dex from 0x{begin:x}, size 0x{size:x}"))?;
+                    if DexParser::new(&bytes).is_ok() {
+                        return Ok(Some((begin, size, bytes)));
                     }
                 }
                 off += idx + 4;
@@ -1094,6 +1133,9 @@ mod imp {
     fn scan_uid_maps(uid: u32) -> Result<Vec<(u64, u32, Vec<u8>)>> {
         let mut found = Vec::new();
         for pid in pids_for_uid(uid)? {
+            if !keep_running() {
+                break;
+            }
             match scan_process_maps(pid) {
                 Ok(mut dexes) => found.append(&mut dexes),
                 Err(err) => eprintln!("maps scan failed for pid {pid}: {err:#}"),
@@ -1135,6 +1177,9 @@ mod imp {
             .with_context(|| format!("read /proc/{pid}/maps"))?;
         let mut found = Vec::new();
         for line in maps.lines() {
+            if !keep_running() {
+                break;
+            }
             let Some(region) = parse_readable_map_region(line) else {
                 continue;
             };
@@ -1169,6 +1214,9 @@ mod imp {
     fn scan_region_for_dex(pid: u32, start: u64, end: u64, found: &mut Vec<(u64, u32, Vec<u8>)>) {
         let mut pos = start;
         while pos + DEX_HEADER_SIZE as u64 <= end {
+            if !keep_running() {
+                return;
+            }
             let Ok(page) = read_remote_mem(pid, pos, CODE_ITEM_BACKSCAN_STEP as u32) else {
                 pos = pos.saturating_add(CODE_ITEM_BACKSCAN_STEP);
                 continue;
@@ -1284,6 +1332,7 @@ mod imp {
         );
         print_target("VerifyClass", targets.verify_class);
         print_target("DexFile::DexFile", targets.dex_file_ctor);
+        print_target("ClassLinker::RegisterDexFile", targets.register_dex_file);
         println!(
             "[+] nterp_op_invoke_* pattern targets: {}",
             targets.nterp_invoke_addrs.len()
@@ -1300,6 +1349,7 @@ mod imp {
         println!("[+] ART runtime layout: {}", runtime_layout.summary());
         println!("[+] Filtering on uid {}", config.uid);
         let _ = (
+            config.pid,
             config.package_name,
             config.trace,
             config.auto_fix,

@@ -140,9 +140,11 @@ struct
 } config_map SEC(".maps");
 
 // ART runtime layout map. User space resolves the offsets and writes one entry.
+// HASH so that lookup before user-space init returns NULL and the BPF program
+// can fall back to default_art_layout instead of reading a zeroed entry.
 struct
 {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct art_layout_t);
