@@ -11,7 +11,7 @@
 ## 功能
 
 - `dump`：通过 ART 入口、DexFile 注册/构造、CodeItem 反扫、maps 扫描和 native buffer 扫描捕获 DEX。
-- `fix`：把记录到的方法字节码回填到 DEX，输出到 `fix/` 目录。
+- `fix`：把记录到的方法字节码回填到 DEX，修复版保留在 `fix/`，最终可用结果汇总到 `final/`。
 - `offsets`：从 `libart.so` 定位 hook 目标，必要时可手动指定 ART layout。
 
 ## 环境
@@ -38,6 +38,8 @@ su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
 ```
 
 ## 说明
+
+`dump` 默认会在退出时执行 `fix`。输出目录中的原始 `dex_*.dex` 会保留；`fix/` 保存成功回填的方法修复版；`final/` 是最终使用目录，有修复版时优先放修复版，没有对应 `_code.json` 或修复失败时放原始 DEX。
 
 默认 ART layout 按 Android 13+ 常见布局处理；ROM 偏移不一致时使用 `--art-layout`。如果目标只在 native 层短暂解密碎片化方法体，内存中不保留连续合法 DEX，需要按壳适配。
 

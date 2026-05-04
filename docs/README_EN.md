@@ -11,7 +11,7 @@ An eBPF DEX dumper for rooted Android 13-17 ARM64 devices. It captures DEX data 
 ## Features
 
 - `dump`: captures DEX through ART entries, DexFile registration/construction, CodeItem backscan, maps scan, and native buffer scan.
-- `fix`: writes recorded method bytecode back into DEX files under `fix/`.
+- `fix`: writes recorded method bytecode back into DEX files, keeps repaired copies under `fix/`, and gathers usable outputs under `final/`.
 - `offsets`: resolves hook targets from `libart.so`; manual ART layout is supported when needed.
 
 ## Requirements
@@ -80,6 +80,8 @@ Outputs under `dist/`:
 - `eBPFDexDumper_android_arm64.tar.gz`
 
 ## Notes
+
+`dump` runs `fix` on exit by default. The original `dex_*.dex` files remain in the output directory; `fix/` stores repaired copies when bytecode records can be applied; `final/` is the usable result set, preferring repaired DEX files and falling back to original dumps when no matching `_code.json` exists or repair fails.
 
 The default ART layout targets common Android 13+ layouts. Use `--art-layout` when a ROM uses different offsets. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
 

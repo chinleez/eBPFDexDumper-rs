@@ -23,33 +23,46 @@ pub struct FixStats {
 
 pub fn fix_dex_directory(output_dir: &Path) -> Result<()> {
     let pairs = find_pairs(output_dir)?;
-    if pairs.is_empty() {
-        anyhow::bail!("no dex_*_code.json found in {}", output_dir.display());
+    let dex_files = find_root_dex_files(output_dir)?;
+    if dex_files.is_empty() {
+        anyhow::bail!("no dex_*.dex found in {}", output_dir.display());
     }
 
     let fix_dir = output_dir.join("fix");
+    let final_dir = output_dir.join("final");
     fs::create_dir_all(&fix_dir)
         .with_context(|| format!("failed to create {}", fix_dir.display()))?;
+    fs::create_dir_all(&final_dir)
+        .with_context(|| format!("failed to create {}", final_dir.display()))?;
 
-    for (base, json_path) in pairs {
-        let dex_path = output_dir.join(format!("{base}.dex"));
-        if !dex_path.exists() {
-            continue;
-        }
-        let out_path = fix_dir.join(format!("{base}_fix.dex"));
-        match fix_one_dex(&dex_path, &json_path, &out_path) {
-            Ok(stats) => {
-                println!(
-                    "Applied: {}, Skipped: {}, LengthMismatch: {} for {}",
-                    stats.applied,
-                    stats.skipped,
-                    stats.length_mismatch,
-                    dex_path.file_name().unwrap_or_default().to_string_lossy()
-                );
-                println!("[+] Wrote {}", out_path.display());
+    for (base, dex_path) in dex_files {
+        let final_path = final_dir.join(format!("{base}.dex"));
+        match pairs.get(&base) {
+            Some(json_path) => {
+                let out_path = fix_dir.join(format!("{base}_fix.dex"));
+                match fix_one_dex(&dex_path, json_path, &out_path) {
+                    Ok(stats) => {
+                        println!(
+                            "Applied: {}, Skipped: {}, LengthMismatch: {} for {}",
+                            stats.applied,
+                            stats.skipped,
+                            stats.length_mismatch,
+                            dex_path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        copy_file(&out_path, &final_path)?;
+                        println!("[+] Wrote {}", out_path.display());
+                        println!("[+] Final {}", final_path.display());
+                    }
+                    Err(err) => {
+                        println!("[!] Fix failed for {}: {err:#}", dex_path.display());
+                        copy_file(&dex_path, &final_path)?;
+                        println!("[+] Final fallback {}", final_path.display());
+                    }
+                }
             }
-            Err(err) => {
-                println!("[!] Fix failed for {}: {err:#}", dex_path.display());
+            None => {
+                copy_file(&dex_path, &final_path)?;
+                println!("[+] Final original {}", final_path.display());
             }
         }
     }
@@ -190,6 +203,24 @@ fn find_pairs(output_dir: &Path) -> Result<HashMap<String, PathBuf>> {
     Ok(pairs)
 }
 
+fn find_root_dex_files(output_dir: &Path) -> Result<HashMap<String, PathBuf>> {
+    let mut dex_files = HashMap::new();
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(base) = dex_file_base(&name) {
+            dex_files.insert(base, entry.path());
+        }
+    }
+    Ok(dex_files)
+}
+
 fn collect_pairs(dir: &Path, pairs: &mut HashMap<String, PathBuf>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
@@ -229,6 +260,33 @@ fn dex_code_json_base(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn dex_file_base(name: &str) -> Option<String> {
+    if !name.starts_with("dex_") || !name.ends_with(".dex") {
+        return None;
+    }
+    let stem = name.strip_suffix(".dex")?;
+    let mut parts = stem.split('_');
+    if parts.next()? != "dex" {
+        return None;
+    }
+    let begin = parts.next()?;
+    let size = parts.next()?;
+    if parts.next().is_some() || begin.is_empty() || size.is_empty() {
+        return None;
+    }
+    if begin.bytes().all(|b| b.is_ascii_hexdigit()) && size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    fs::copy(src, dst)
+        .with_context(|| format!("failed to copy {} to {}", src.display(), dst.display()))?;
+    Ok(())
 }
 
 fn skip_fields(data: &[u8], pos: &mut usize, count: u32) -> Result<()> {
@@ -278,6 +336,53 @@ mod tests {
         );
         assert!(dex_code_json_base("dex_1234_nope_code.json").is_none());
         assert!(dex_code_json_base("not_dex_1234_abcd_code.json").is_none());
+    }
+
+    #[test]
+    fn parses_dex_file_base() {
+        assert_eq!(
+            dex_file_base("dex_1234_abcd.dex").as_deref(),
+            Some("dex_1234_abcd")
+        );
+        assert!(dex_file_base("dex_1234_nope.dex").is_none());
+        assert!(dex_file_base("dex_1234_abcd_fix.dex").is_none());
+        assert!(dex_file_base("not_dex_1234_abcd.dex").is_none());
+    }
+
+    #[test]
+    fn fix_directory_writes_final_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed_base = "dex_1000_b0";
+        let original_base = "dex_2000_b0";
+
+        let fixed_dex_path = dir.path().join(format!("{fixed_base}.dex"));
+        let original_dex_path = dir.path().join(format!("{original_base}.dex"));
+        let json_path = dir.path().join(format!("{fixed_base}_code.json"));
+
+        fs::write(&fixed_dex_path, minimal_dex_with_code_item()).unwrap();
+        fs::write(&original_dex_path, minimal_dex_with_code_item()).unwrap();
+        fs::write(
+            &json_path,
+            r#"[{"name":"void Lx;.m()","method_idx":0,"code":"01020304"}]"#,
+        )
+        .unwrap();
+
+        fix_dex_directory(dir.path()).unwrap();
+
+        let fixed_final =
+            fs::read(dir.path().join("final").join(format!("{fixed_base}.dex"))).unwrap();
+        let original_final = fs::read(
+            dir.path()
+                .join("final")
+                .join(format!("{original_base}.dex")),
+        )
+        .unwrap();
+        let fixed_copy =
+            fs::read(dir.path().join("fix").join(format!("{fixed_base}_fix.dex"))).unwrap();
+
+        assert_eq!(&fixed_final[0xa0..0xa4], &[1, 2, 3, 4]);
+        assert_eq!(fixed_final, fixed_copy);
+        assert_eq!(original_final, fs::read(original_dex_path).unwrap());
     }
 
     #[test]

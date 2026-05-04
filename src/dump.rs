@@ -29,7 +29,8 @@ mod imp {
     use aya::{include_bytes_aligned, Btf, EbpfLoader, Pod};
     use object::Endianness;
     use serde::Serialize;
-    use std::collections::HashMap;
+    use sha1::{Digest, Sha1};
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,6 +90,7 @@ mod imp {
         output_dir: PathBuf,
         trace: bool,
         dex_cache: RwLock<HashMap<u64, Vec<u8>>>,
+        dex_hashes: RwLock<HashSet<[u8; 20]>>,
         dex_sizes: RwLock<HashMap<u64, u32>>,
         pending_dex: RwLock<HashMap<u64, DexRecvState>>,
         method_records: RwLock<HashMap<u64, Vec<MethodCodeRecord>>>,
@@ -108,6 +110,7 @@ mod imp {
                 output_dir,
                 trace,
                 dex_cache: RwLock::new(HashMap::new()),
+                dex_hashes: RwLock::new(HashSet::new()),
                 dex_sizes: RwLock::new(HashMap::new()),
                 pending_dex: RwLock::new(HashMap::new()),
                 method_records: RwLock::new(HashMap::new()),
@@ -315,6 +318,17 @@ mod imp {
                     );
                     return;
                 }
+                let hash = Self::dex_content_hash(&bytes);
+                if !self.dex_hashes.write().unwrap().insert(hash) {
+                    if self.trace {
+                        eprintln!(
+                            "Skip duplicate dex 0x{begin:x} ({} bytes, sha1={})",
+                            bytes.len(),
+                            hex::encode(hash)
+                        );
+                    }
+                    return;
+                }
                 // Drop any half-assembled chunks for this dex; another path
                 // just landed a complete, valid copy.
                 self.pending_dex.write().unwrap().remove(&begin);
@@ -331,6 +345,12 @@ mod imp {
                 ),
                 Err(err) => eprintln!("Write dexData failed for {}: {err}", file_name.display()),
             }
+        }
+
+        fn dex_content_hash(bytes: &[u8]) -> [u8; 20] {
+            let mut sha1 = Sha1::new();
+            sha1.update(bytes);
+            sha1.finalize().into()
         }
 
         fn method_name(&self, begin: u64, method_idx: u32) -> String {
