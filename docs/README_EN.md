@@ -3,6 +3,11 @@
 [![CI](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/ci.yml)
 [![Release](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/release.yml/badge.svg)](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/chinleez/eBPFDexDumper-rs)](https://github.com/chinleez/eBPFDexDumper-rs/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/chinleez/eBPFDexDumper-rs/total)](https://github.com/chinleez/eBPFDexDumper-rs/releases)
+[![License](https://img.shields.io/github/license/chinleez/eBPFDexDumper-rs)](https://github.com/chinleez/eBPFDexDumper-rs/blob/main/LICENSE)
+[![Android](https://img.shields.io/badge/Android-13--17%20ARM64-3DDC84?logo=android&logoColor=white)](https://github.com/chinleez/eBPFDexDumper-rs)
+[![GitHub stars](https://img.shields.io/github/stars/chinleez/eBPFDexDumper-rs?style=social)](https://github.com/chinleez/eBPFDexDumper-rs/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/chinleez/eBPFDexDumper-rs?style=social)](https://github.com/chinleez/eBPFDexDumper-rs/network/members)
 
 [中文](../README.md) | English
 
