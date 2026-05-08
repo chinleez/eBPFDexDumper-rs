@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>eBPFDexDumper Core Architecture Blueprint</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      padding: 1.25rem;
+      color: #0f172a;
+      background: #f8fafc;
+      font-family: "JetBrains Mono", monospace;
+    }
+
+    .container {
+      max-width: 1540px;
+      margin: 0 auto;
+    }
+
+    .header {
+      margin-bottom: 1.5rem;
+    }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      gap: 0.875rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .pulse-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #0891b2;
+      box-shadow: 0 0 16px rgba(8, 145, 178, 0.32);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.52; transform: scale(0.86); }
+    }
+
+    h1 {
+      color: #0f172a;
+      font-size: 1.45rem;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin-left: 1.8rem;
+      color: #475569;
+      font-size: 0.84rem;
+      line-height: 1.6;
+    }
+
+    .diagram-container {
+      padding: 0.75rem;
+      overflow-x: auto;
+      border: 1px solid #cbd5e1;
+      border-radius: 12px;
+      background: #ffffff;
+    }
+
+    .blueprint-row {
+      display: grid;
+      grid-template-columns: 132px 14px minmax(1080px, 1fr) 14px 132px;
+      align-items: stretch;
+      gap: 0.4rem;
+      min-width: 1396px;
+      width: 100%;
+    }
+
+    .flow-arrow {
+      position: relative;
+      align-self: center;
+      width: 14px;
+      height: 2px;
+      background: #64748b;
+    }
+
+    .flow-arrow::after {
+      position: absolute;
+      top: -4px;
+      right: -1px;
+      width: 0;
+      height: 0;
+      border-top: 5px solid transparent;
+      border-bottom: 5px solid transparent;
+      border-left: 8px solid #64748b;
+      content: "";
+    }
+
+    .side-panel {
+      display: grid;
+      grid-template-rows: auto repeat(4, 1fr) auto;
+      gap: 0.65rem;
+      min-height: 760px;
+      padding: 0.85rem 0.65rem;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #f8fafc;
+      text-align: center;
+    }
+
+    .side-panel.output {
+      border-color: #99f6e4;
+      background: #f0fdfa;
+    }
+
+    .side-panel h2 {
+      color: #0f172a;
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+
+    .side-item {
+      display: flex;
+      min-height: 76px;
+      padding: 0.45rem 0.35rem;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #dbe3ef;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+
+    .side-panel h3 {
+      margin-bottom: 0.3rem;
+      color: #1e293b;
+      font-size: 0.58rem;
+      font-weight: 600;
+    }
+
+    .side-panel p {
+      color: #64748b;
+      font-size: 0.5rem;
+      line-height: 1.5;
+    }
+
+    .side-panel .rule {
+      height: 1px;
+      margin: 0 auto;
+      width: 44px;
+      background: #cbd5e1;
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      min-width: 0;
+      height: auto;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1rem;
+      margin-top: 1.5rem;
+    }
+
+    .card {
+      padding: 1rem 1.1rem;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.65rem;
+    }
+
+    .card-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .cyan { background: #22d3ee; }
+    .emerald { background: #34d399; }
+    .violet { background: #a78bfa; }
+    .amber { background: #fbbf24; }
+    .rose { background: #fb7185; }
+
+    .card h3 {
+      color: #0f172a;
+      font-size: 0.86rem;
+      font-weight: 600;
+    }
+
+    .card ul {
+      list-style: none;
+      color: #475569;
+      font-size: 0.74rem;
+      line-height: 1.62;
+    }
+
+    .footer {
+      margin-top: 1.25rem;
+      color: #64748b;
+      text-align: center;
+      font-size: 0.72rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>eBPFDexDumper 核心架构蓝图</h1>
+      </div>
+      <p class="subtitle">基于当前代码静态梳理：CLI 入口、ART 目标解析、eBPF 采集、RingBuf 事件、DEX 落盘与修复链路。</p>
+    </header>
+
+    <main class="diagram-container">
+      <div class="blueprint-row">
+      <aside class="side-panel" aria-label="输入侧说明">
+        <h2>输入侧</h2>
+        <div class="side-item">
+        <h3>运行参数</h3>
+        <p>uid / pid / name</p>
+        </div>
+        <div class="side-item">
+        <h3>目标文件</h3>
+        <p>libart.so</p>
+        </div>
+        <div class="side-item">
+        <h3>探针策略</h3>
+        <p>full<br>lifecycle<br>maps-only</p>
+        </div>
+        <div class="side-item">
+        <h3>环境前提</h3>
+        <p>Linux / Android<br>root / eBPF</p>
+        </div>
+        <div class="rule"></div>
+        <p>先定位目标<br>再缩小采集面<br>最后写出产物</p>
+      </aside>
+      <div class="flow-arrow" aria-hidden="true"></div>
+
+      <svg viewBox="0 0 1160 840" role="img" aria-label="eBPFDexDumper core architecture blueprint">
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#475569" />
+          </marker>
+          <marker id="rose-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#e11d48" />
+          </marker>
+          <marker id="orange-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#ea580c" />
+          </marker>
+          <marker id="cyan-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#0891b2" />
+          </marker>
+          <marker id="emerald-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#059669" />
+          </marker>
+          <marker id="violet-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#7c3aed" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#e2e8f0" stroke-width="0.7"/>
+          </pattern>
+          <style>
+            .label { fill: #0f172a; font-size: 12px; font-weight: 600; text-anchor: middle; }
+            .sub { fill: #475569; font-size: 9px; text-anchor: middle; }
+            .tiny { fill: #64748b; font-size: 8px; text-anchor: middle; }
+            .note { fill: #334155; font-size: 8px; }
+            .arrow-control,
+            .arrow-map,
+            .arrow-attach,
+            .arrow-runtime,
+            .arrow-capture,
+            .arrow-event,
+            .arrow-output,
+            .arrow-fix,
+            .arrow-scan {
+              fill: none;
+              stroke-linecap: round;
+              stroke-linejoin: round;
+              vector-effect: non-scaling-stroke;
+            }
+            .arrow-control { stroke: #334155; stroke-width: 1.85; marker-end: url(#arrowhead); opacity: 0.78; }
+            .arrow-map { stroke: #ea580c; stroke-width: 1.55; marker-end: url(#orange-arrowhead); opacity: 0.62; }
+            .arrow-attach { stroke: #e11d48; stroke-width: 1.55; marker-end: url(#rose-arrowhead); opacity: 0.62; }
+            .arrow-runtime { stroke: #64748b; stroke-width: 1.55; marker-end: url(#arrowhead); opacity: 0.62; }
+            .arrow-capture { stroke: #0891b2; stroke-width: 1.75; marker-end: url(#cyan-arrowhead); opacity: 0.74; }
+            .arrow-event { stroke: #ea580c; stroke-width: 1.65; stroke-dasharray: 6,5; marker-end: url(#orange-arrowhead); opacity: 0.76; }
+            .arrow-output { stroke: #059669; stroke-width: 1.85; marker-end: url(#emerald-arrowhead); opacity: 0.78; }
+            .arrow-fix { stroke: #7c3aed; stroke-width: 1.7; marker-end: url(#violet-arrowhead); opacity: 0.72; }
+            .arrow-scan { stroke: #e11d48; stroke-width: 1.6; stroke-dasharray: 6,5; marker-end: url(#rose-arrowhead); opacity: 0.72; }
+            .boundary-text { font-size: 10px; font-weight: 600; }
+          </style>
+        </defs>
+
+        <rect width="1160" height="840" fill="#ffffff" />
+        <rect width="1160" height="840" fill="url(#grid)" />
+
+        <!-- Section boundaries sit below connectors so arrows remain visible on the light theme. -->
+        <rect x="28" y="34" width="1068" height="178" rx="12" fill="#fffbeb" stroke="#d97706" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="44" y="54" class="boundary-text" fill="#92400e">Host build / CLI surface</text>
+
+        <rect x="28" y="238" width="1068" height="304" rx="12" fill="#fff1f2" stroke="#e11d48" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="44" y="258" class="boundary-text" fill="#be123c">Target Android process / kernel-visible probe surface</text>
+
+        <rect x="28" y="568" width="1068" height="202" rx="12" fill="#f0fdfa" stroke="#0d9488" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="44" y="588" class="boundary-text" fill="#0f766e">User-space event collector and output pipeline</text>
+
+        <!-- Connections are intentionally painted before component boxes. -->
+        <!-- Host control flow: CLI -> config -> resolver -> BPF object -> Aya loader. -->
+        <path class="arrow-control" d="M 166 110 H 236" />
+        <path class="arrow-control" d="M 356 110 H 426" />
+        <path class="arrow-control" d="M 546 110 H 626" />
+        <path class="arrow-control" d="M 746 110 H 812" />
+        <path class="arrow-map" d="M 296 144 V 184" />
+        <path class="arrow-map" d="M 486 144 V 184" />
+        <path class="arrow-map" d="M 686 144 V 184" />
+
+        <!-- Loader writes BPF maps and attaches the selected probe surface. -->
+        <path class="arrow-map" d="M 300 210 C 300 246, 748 248, 790 278" />
+        <path class="arrow-map" d="M 492 210 C 492 240, 792 242, 820 278" />
+        <path class="arrow-map" d="M 690 210 C 690 236, 834 236, 834 278" />
+        <path class="arrow-attach" d="M 876 144 V 230 H 365 V 278" />
+        <path class="arrow-attach" d="M 876 144 V 230 H 593 V 278" />
+        <path class="arrow-attach" d="M 876 144 C 906 188, 834 232, 834 278" />
+
+        <!-- Runtime execution: app behavior reaches ART/libc probes and BPF handlers. -->
+        <path class="arrow-runtime" d="M 210 314 H 292" />
+        <path class="arrow-runtime" d="M 210 326 C 310 326, 420 314, 520 314" />
+        <path class="arrow-capture" d="M 438 302 C 520 250, 686 250, 748 302" />
+        <path class="arrow-capture" d="M 666 314 H 748" />
+        <path class="arrow-attach" d="M 920 314 C 1015 314, 1030 414, 920 430" />
+        <path class="arrow-attach" d="M 920 456 H 982" />
+
+        <!-- Probe handlers classify captured memory into DEX, method, and native paths. -->
+        <path class="arrow-capture" d="M 365 350 V 386" />
+        <path class="arrow-capture" d="M 365 350 C 430 378, 560 370, 590 386" />
+        <path class="arrow-capture" d="M 593 350 C 593 370, 790 370, 830 386" />
+        <path class="arrow-capture" d="M 834 350 V 386" />
+        <path class="arrow-capture" d="M 476 426 H 528" />
+        <path class="arrow-capture" d="M 698 426 H 742" />
+
+        <!-- BPF ring-buffer events drain into user-space state. -->
+        <path class="arrow-event" d="M 391 466 C 391 548, 318 548, 318 604" />
+        <path class="arrow-event" d="M 613 466 C 613 548, 350 548, 340 604" />
+        <path class="arrow-event" d="M 831 466 C 831 548, 392 552, 360 620" />
+        <path class="arrow-output" d="M 370 646 H 470" />
+        <path class="arrow-output" d="M 210 642 H 470" />
+
+        <!-- User-space outputs: raw dumps, optional fix pass, final disk artifacts. -->
+        <path class="arrow-fix" d="M 710 630 H 816" />
+        <path class="arrow-output" d="M 710 670 C 820 720, 982 710, 1040 670" />
+        <path class="arrow-fix" d="M 996 652 H 1008" />
+        <path class="arrow-scan" d="M 100 350 C 100 535, 168 604, 242 604" />
+
+        <rect x="46" y="76" width="120" height="68" rx="6" fill="#ffffff"/>
+        <rect x="46" y="76" width="120" height="68" rx="6" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
+        <text x="106" y="101" class="label">User CLI</text>
+        <text x="106" y="118" class="sub">dump / fix / offsets</text>
+        <text x="106" y="133" class="tiny">src/main.rs</text>
+
+        <rect x="236" y="76" width="120" height="68" rx="6" fill="#ffffff"/>
+        <rect x="236" y="76" width="120" height="68" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+        <text x="296" y="101" class="label">DumpConfig</text>
+        <text x="296" y="118" class="sub">uid / pid / flags</text>
+        <text x="296" y="133" class="tiny">probe-mode</text>
+
+        <rect x="426" y="76" width="120" height="68" rx="6" fill="#ffffff"/>
+        <rect x="426" y="76" width="120" height="68" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+        <text x="486" y="101" class="label">ART Resolver</text>
+        <text x="486" y="118" class="sub">symbol / pattern</text>
+        <text x="486" y="133" class="tiny">src/art.rs</text>
+
+        <rect x="626" y="76" width="120" height="68" rx="6" fill="#ffffff"/>
+        <rect x="626" y="76" width="120" height="68" rx="6" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+        <text x="686" y="101" class="label">BPF Object</text>
+        <text x="686" y="118" class="sub">build.rs + clang</text>
+        <text x="686" y="133" class="tiny">bpf_arm64_bpfel.o</text>
+
+        <rect x="812" y="76" width="128" height="68" rx="6" fill="#ffffff"/>
+        <rect x="812" y="76" width="128" height="68" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+        <text x="876" y="101" class="label">Aya Loader</text>
+        <text x="876" y="118" class="sub">load + attach</text>
+        <text x="876" y="133" class="tiny">src/dump.rs</text>
+
+        <rect x="240" y="184" width="120" height="26" rx="4" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+        <text x="300" y="201" fill="#9a3412" font-size="8" text-anchor="middle">config_map</text>
+        <rect x="432" y="184" width="120" height="26" rx="4" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+        <text x="492" y="201" fill="#9a3412" font-size="8" text-anchor="middle">art_layout_map</text>
+        <rect x="630" y="184" width="120" height="26" rx="4" fill="#ffedd5" stroke="#ea580c" stroke-width="1"/>
+        <text x="690" y="201" fill="#9a3412" font-size="8" text-anchor="middle">embedded BPF</text>
+
+        <rect x="62" y="278" width="148" height="72" rx="6" fill="#ffffff"/>
+        <rect x="62" y="278" width="148" height="72" rx="6" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
+        <text x="136" y="303" class="label">App Process</text>
+        <text x="136" y="320" class="sub">UID / optional PID</text>
+        <text x="136" y="335" class="tiny">package lookup + oat clean</text>
+
+        <rect x="292" y="278" width="146" height="72" rx="6" fill="#ffffff"/>
+        <rect x="292" y="278" width="146" height="72" rx="6" fill="#ffe4e6" stroke="#e11d48" stroke-width="1.5"/>
+        <text x="365" y="303" class="label">ART Uprobes</text>
+        <text x="365" y="320" class="sub">Execute / nterp</text>
+        <text x="365" y="335" class="tiny">DexFile lifecycle</text>
+
+        <rect x="520" y="278" width="146" height="72" rx="6" fill="#ffffff"/>
+        <rect x="520" y="278" width="146" height="72" rx="6" fill="#ffe4e6" stroke="#e11d48" stroke-width="1.5"/>
+        <text x="593" y="303" class="label">libc Uprobes</text>
+        <text x="593" y="320" class="sub">mmap / mprotect</text>
+        <text x="593" y="335" class="tiny">memcpy / memmove</text>
+
+        <rect x="748" y="278" width="172" height="72" rx="6" fill="#ffffff"/>
+        <rect x="748" y="278" width="172" height="72" rx="6" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/>
+        <text x="834" y="303" class="label">BPF Program</text>
+        <text x="834" y="320" class="sub">filter + read user memory</text>
+        <text x="834" y="335" class="tiny">bpf/bpf.c + header.h</text>
+
+        <rect x="306" y="386" width="170" height="80" rx="6" fill="#ffffff"/>
+        <rect x="306" y="386" width="170" height="80" rx="6" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/>
+        <text x="391" y="410" class="label">DEX Discovery</text>
+        <text x="391" y="427" class="sub">DexFile.begin + size</text>
+        <text x="391" y="442" class="tiny">CodeItem fallback</text>
+        <text x="391" y="457" class="tiny">chunked DEX reads</text>
+
+        <rect x="528" y="386" width="170" height="80" rx="6" fill="#ffffff"/>
+        <rect x="528" y="386" width="170" height="80" rx="6" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/>
+        <text x="613" y="410" class="label">Method Capture</text>
+        <text x="613" y="427" class="sub">ArtMethod.data</text>
+        <text x="613" y="442" class="tiny">method_idx + bytecode</text>
+        <text x="613" y="457" class="tiny">methodCodeCache</text>
+
+        <rect x="742" y="386" width="178" height="80" rx="6" fill="#ffffff"/>
+        <rect x="742" y="386" width="178" height="80" rx="6" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/>
+        <text x="831" y="410" class="label">Native Buffer</text>
+        <text x="831" y="427" class="sub">anonymous DEX / ELF</text>
+        <text x="831" y="442" class="tiny">native_buffer_events</text>
+        <text x="831" y="457" class="tiny">optional native_elf</text>
+
+        <rect x="982" y="278" width="82" height="188" rx="8" fill="#fff1f2" stroke="#e11d48" stroke-width="1" stroke-dasharray="4,4"/>
+        <text x="992" y="294" fill="#be123c" font-size="8">probe-mode</text>
+        <text x="1023" y="326" fill="#475569" font-size="8" text-anchor="middle">full</text>
+        <text x="1023" y="361" fill="#475569" font-size="8" text-anchor="middle">lifecycle</text>
+        <text x="1023" y="396" fill="#475569" font-size="8" text-anchor="middle">maps-only</text>
+        <text x="1023" y="431" fill="#475569" font-size="8" text-anchor="middle">no BPF</text>
+
+        <rect x="240" y="604" width="130" height="84" rx="6" fill="#ffffff"/>
+        <rect x="240" y="604" width="130" height="84" rx="6" fill="#ffedd5" stroke="#ea580c" stroke-width="1.5"/>
+        <text x="305" y="629" class="label">RingBuf Maps</text>
+        <text x="305" y="646" class="sub">events / chunks</text>
+        <text x="305" y="661" class="tiny">method_events</text>
+        <text x="305" y="676" class="tiny">read + debug + native</text>
+
+        <rect x="470" y="596" width="240" height="112" rx="6" fill="#ffffff"/>
+        <rect x="470" y="596" width="240" height="112" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.5"/>
+        <text x="590" y="621" class="label">DumpState</text>
+        <text x="590" y="638" class="sub">dedupe / pending chunks / maps cache</text>
+        <text x="590" y="654" class="tiny">save dex_*.dex</text>
+        <text x="590" y="669" class="tiny">save dex_*_code.json</text>
+        <text x="590" y="684" class="tiny">save native_elf candidates</text>
+
+        <rect x="816" y="596" width="180" height="112" rx="6" fill="#ffffff"/>
+        <rect x="816" y="596" width="180" height="112" rx="6" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+        <text x="906" y="621" class="label">Fix Pipeline</text>
+        <text x="906" y="638" class="sub">src/fix.rs + dex.rs</text>
+        <text x="906" y="654" class="tiny">apply method code</text>
+        <text x="906" y="669" class="tiny">SHA1 + Adler32</text>
+        <text x="906" y="684" class="tiny">final/ + missed.json</text>
+
+        <rect x="70" y="612" width="140" height="58" rx="6" fill="#ffffff"/>
+        <rect x="70" y="612" width="140" height="58" rx="6" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
+        <text x="140" y="636" class="label">/proc maps</text>
+        <text x="140" y="653" class="sub">one-shot DEX scan</text>
+
+        <rect x="1008" y="612" width="64" height="58" rx="6" fill="#ffffff"/>
+        <rect x="1008" y="612" width="64" height="58" rx="6" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
+        <text x="1040" y="636" class="label">Disk</text>
+        <text x="1040" y="653" class="sub">out dir</text>
+
+        <!-- Legend below all boundaries. -->
+        <rect x="66" y="784" width="1028" height="46" rx="6" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1"/>
+        <circle cx="94" cy="799" r="5" fill="#64748b"/><text x="108" y="803" class="note">CLI / external</text>
+        <circle cx="234" cy="799" r="5" fill="#059669"/><text x="248" y="803" class="note">Rust user-space</text>
+        <circle cx="390" cy="799" r="5" fill="#0891b2"/><text x="404" y="803" class="note">BPF capture logic</text>
+        <circle cx="560" cy="799" r="5" fill="#e11d48"/><text x="574" y="803" class="note">Probe/security boundary</text>
+        <circle cx="776" cy="799" r="5" fill="#7c3aed"/><text x="790" y="803" class="note">DEX parsing/repair</text>
+        <circle cx="952" cy="799" r="5" fill="#ea580c"/><text x="966" y="803" class="note">BPF maps / event bus</text>
+        <line x1="96" y1="818" x2="132" y2="818" class="arrow-control"/>
+        <text x="144" y="821" class="note">control</text>
+        <line x1="228" y1="818" x2="264" y2="818" class="arrow-map"/>
+        <text x="276" y="821" class="note">map/config</text>
+        <line x1="392" y1="818" x2="428" y2="818" class="arrow-attach"/>
+        <text x="440" y="821" class="note">attach/mode</text>
+        <line x1="566" y1="818" x2="602" y2="818" class="arrow-capture"/>
+        <text x="614" y="821" class="note">capture</text>
+        <line x1="722" y1="818" x2="758" y2="818" class="arrow-event"/>
+        <text x="770" y="821" class="note">ringbuf event</text>
+        <line x1="912" y1="818" x2="948" y2="818" class="arrow-fix"/>
+        <text x="960" y="821" class="note">fix/output</text>
+      </svg>
+      <div class="flow-arrow" aria-hidden="true"></div>
+      <aside class="side-panel output" aria-label="输出侧说明">
+        <h2>输出侧</h2>
+        <div class="side-item">
+        <h3>原始采集</h3>
+        <p>dex_*.dex<br>dex_*_code.json</p>
+        </div>
+        <div class="side-item">
+        <h3>修复结果</h3>
+        <p>fix/*.dex<br>final/*.dex</p>
+        </div>
+        <div class="side-item">
+        <h3>覆盖率反馈</h3>
+        <p>missed.json<br>skipped / mismatch</p>
+        </div>
+        <div class="side-item">
+        <h3>风险边界</h3>
+        <p>ART layout 假设<br>native buffer 误报<br>运行时权限</p>
+        </div>
+        <div class="rule"></div>
+        <p>最终 DEX 质量<br>取决于运行覆盖<br>和 CodeItem 捕获</p>
+      </aside>
+      </div>
+    </main>
+
+    <section class="cards" aria-label="architecture notes">
+      <article class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>核心执行链</h3>
+        </div>
+        <ul>
+          <li>• `src/main.rs` 解析 `dump/fix/offsets`，把 UID、PID、libart、输出目录和探针模式收敛为 `DumpConfig`。</li>
+          <li>• `src/art.rs` 从 `libart.so` 解析符号、签名或字符串引用，产出 ART hook 目标与 Android 13+ 默认布局。</li>
+          <li>• `src/dump.rs` 通过 Aya 加载 `build.rs` 编译出的 BPF 对象，写入 `config_map` 与 `art_layout_map` 后 attach uprobe。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div class="card-dot cyan"></div>
+          <h3>采集与降级</h3>
+        </div>
+        <ul>
+          <li>• `bpf/bpf.c` 从 ART 方法、DexFile 生命周期和 libc native buffer 行为中产生 DEX、方法字节码、布局诊断和 native buffer 事件。</li>
+          <li>• Rust 侧持续 drain RingBuf，按 DEX begin 地址去重、拼 chunk、生成 `dex_*.dex` 与 `dex_*_code.json`。</li>
+          <li>• `--probe-mode maps-only` 直接走 `/proc/&lt;pid&gt;/maps` 扫描，不加载 BPF；`lifecycle` 缩小 attach 面。</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div class="card-dot violet"></div>
+          <h3>修复与产物</h3>
+        </div>
+        <ul>
+          <li>• `src/fix.rs` 匹配 `dex_*.dex` 与方法 JSON，把捕获到的 code item 写回 DEX 并重新计算 SHA1/Adler32。</li>
+          <li>• `src/dex.rs` 提供 DEX header、字符串、类型、方法签名和 class data 解析能力，支撑方法命名与覆盖率统计。</li>
+          <li>• 输出目录包含原始 DEX、`fix/` 中间修复件、`final/` 最终 DEX 和缺失方法覆盖报告。</li>
+        </ul>
+      </article>
+    </section>
+
+    <footer class="footer">Generated from current checkout source: src/main.rs, src/dump.rs, src/art.rs, src/fix.rs, src/dex.rs, bpf/bpf.c, bpf/header.h, build.rs.</footer>
+  </div>
+</body>
+</html>
