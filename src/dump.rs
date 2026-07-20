@@ -519,36 +519,35 @@ mod imp {
                     return;
                 }
             }
-            {
-                let mut cache = self.dex_cache.write().unwrap();
-                if cache.contains_key(&begin) {
-                    return;
-                }
-                if let Err(err) = DexParser::new(&bytes) {
-                    // Skip writing malformed dex so the fix stage stays clean
-                    // and we don't leave half-truncated files on disk.
-                    eprintln!(
-                        "Skip malformed dex 0x{begin:x} ({} bytes): {err}",
-                        bytes.len()
-                    );
-                    return;
-                }
-                let hash = Self::dex_content_hash(&bytes);
-                if !self.dex_hashes.write().unwrap().insert(hash) {
-                    if self.trace {
-                        eprintln!(
-                            "Skip duplicate dex 0x{begin:x} ({} bytes, sha1={})",
-                            bytes.len(),
-                            hex::encode(hash)
-                        );
-                    }
-                    return;
-                }
-                // Drop any half-assembled chunks for this dex; another path
-                // just landed a complete, valid copy.
-                self.pending_dex.write().unwrap().remove(&begin);
-                cache.insert(begin, bytes.clone());
+            // Validate before taking any lock so parsing a large dex can't
+            // block the other event handlers.
+            if let Err(err) = DexParser::new(&bytes) {
+                // Skip writing malformed dex so the fix stage stays clean
+                // and we don't leave half-truncated files on disk.
+                eprintln!(
+                    "Skip malformed dex 0x{begin:x} ({} bytes): {err}",
+                    bytes.len()
+                );
+                return;
             }
+            // Dedup on content before the address cache: a new dex may reuse
+            // the begin address of one that was munmap'ed, and the address
+            // cache must not hide it.
+            let hash = Self::dex_content_hash(&bytes);
+            if !self.dex_hashes.write().unwrap().insert(hash) {
+                if self.trace {
+                    eprintln!(
+                        "Skip duplicate dex 0x{begin:x} ({} bytes, sha1={})",
+                        bytes.len(),
+                        hex::encode(hash)
+                    );
+                }
+                return;
+            }
+            // Drop any half-assembled chunks for this dex; another path
+            // just landed a complete, valid copy.
+            self.pending_dex.write().unwrap().remove(&begin);
+            self.dex_cache.write().unwrap().insert(begin, bytes.clone());
             self.dex_sizes.write().unwrap().insert(begin, size);
 
             let file_name = self.output_dir.join(format!("dex_{begin:x}_{size:x}.dex"));
@@ -871,6 +870,24 @@ mod imp {
                 ) {
                     eprintln!(
                         "[-] failed to attach RegisterDexFile at 0x{:x}: {err:#}",
+                        target.addr
+                    );
+                } else {
+                    attached_art += 1;
+                }
+            }
+            // Extra DexFile discovery path: VerifyClass hands us a DexFile*
+            // even on ROMs where the DexFile constructor is inlined. Garbage
+            // pointers are filtered out by the size/magic checks in BPF.
+            if let Some(target) = targets.verify_class {
+                if let Err(err) = attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_verifyClass",
+                    &config.libart,
+                    target.addr,
+                ) {
+                    eprintln!(
+                        "[-] failed to attach VerifyClass at 0x{:x}: {err:#}",
                         target.addr
                     );
                 } else {

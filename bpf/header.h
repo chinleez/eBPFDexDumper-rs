@@ -150,19 +150,23 @@ struct
     __type(value, struct art_layout_t);
 } art_layout_map SEC(".maps");
 
-// dexFileCache map
+// dexFileCache map. LRU so a long-running session that sees more than
+// max_entries dexes evicts the oldest entry instead of failing the update
+// (which would silently re-submit already-seen dexes).
 struct
 {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
     __type(value, u32);
 } dexFileCache_map SEC(".maps");
 
-// methodCodeCache map to track which methods have had their bytecode read
+// methodCodeCache map to track which methods have had their bytecode read.
+// LRU for the same reason as dexFileCache_map; an evicted entry just causes
+// one bytecode re-read, which user space dedups by content.
 struct
 {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 100000);
     __type(key, u64);
     __type(value, u32);
@@ -178,10 +182,12 @@ struct {
     __type(value, buf_t);
 } bufs_m SEC(".maps");
 
-// dex progress map: begin -> next_offset to send
+// dex progress map: begin -> next_offset to send. LRU so the map can't fill
+// up and stall chunk transfer; evicting an in-progress entry just restarts
+// that dex from offset 0, which the user-space interval merge tolerates.
 struct
 {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
     __type(value, u32);
