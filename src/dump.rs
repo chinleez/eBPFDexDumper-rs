@@ -11,6 +11,7 @@ pub struct DumpConfig {
     pub auto_fix: bool,
     pub execute_offset: Option<u64>,
     pub nterp_offset: Option<u64>,
+    pub register_natives_offset: Option<u64>,
     pub runtime_layout: Option<crate::art::ArtRuntimeLayout>,
     pub debug_layout: bool,
     pub code_item_fallback: bool,
@@ -57,7 +58,11 @@ impl ProbeMode {
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod imp {
     use super::DumpConfig;
-    use crate::{art, dex::DexParser, fix, shutdown};
+    use crate::{
+        art,
+        dex::{DexError, DexParser},
+        fix, shutdown,
+    };
     use anyhow::{Context, Result};
     use aya::maps::{HashMap as AyaHashMap, MapData, RingBuf};
     use aya::programs::{ProgramError, UProbe};
@@ -125,6 +130,16 @@ mod imp {
         code: String,
     }
 
+    /// One captured RegisterNatives entry. `fn_ptr` is an absolute runtime
+    /// address, resolved to a module-relative offset when symbols are written.
+    #[derive(Clone, Debug)]
+    struct JniMethod {
+        pid: u32,
+        fn_ptr: u64,
+        name: String,
+        sig: String,
+    }
+
     #[derive(Default)]
     struct DumpState {
         output_dir: PathBuf,
@@ -139,6 +154,7 @@ mod imp {
         method_records: RwLock<HashMap<u64, Vec<MethodCodeRecord>>>,
         method_sig_cache: RwLock<HashMap<(u64, u32), String>>,
         maps_cache: RwLock<HashMap<u32, MapsRegions>>,
+        jni_methods: RwLock<Vec<JniMethod>>,
     }
 
     #[derive(Default, Clone, Debug)]
@@ -246,6 +262,7 @@ mod imp {
                 method_records: RwLock::new(HashMap::new()),
                 method_sig_cache: RwLock::new(HashMap::new()),
                 maps_cache: RwLock::new(HashMap::new()),
+                jni_methods: RwLock::new(Vec::new()),
             }
         }
 
@@ -523,11 +540,18 @@ mod imp {
             // block the other event handlers.
             if let Err(err) = DexParser::new(&bytes) {
                 // Skip writing malformed dex so the fix stage stays clean
-                // and we don't leave half-truncated files on disk.
-                eprintln!(
-                    "Skip malformed dex 0x{begin:x} ({} bytes): {err}",
-                    bytes.len()
-                );
+                // and we don't leave half-truncated files on disk. CompactDex
+                // gets its own line so it doesn't read as a corruption bug.
+                match err {
+                    DexError::CompactDex => eprintln!(
+                        "Skip CompactDex 0x{begin:x} ({} bytes): {err}",
+                        bytes.len()
+                    ),
+                    _ => eprintln!(
+                        "Skip malformed dex 0x{begin:x} ({} bytes): {err}",
+                        bytes.len()
+                    ),
+                }
                 return;
             }
             // Dedup on content before the address cache: a new dex may reuse
@@ -565,6 +589,73 @@ mod imp {
             let mut sha1 = Sha1::new();
             sha1.update(bytes);
             sha1.finalize().into()
+        }
+
+        fn handle_jni_event(&self, data: &[u8]) {
+            let Some(evt) = JniMethodEvent::parse(data) else {
+                return;
+            };
+            if evt.name.is_empty() {
+                return;
+            }
+            self.jni_methods.write().unwrap().push(JniMethod {
+                pid: evt.pid,
+                fn_ptr: evt.fn_ptr,
+                name: evt.name,
+                sig: evt.sig,
+            });
+        }
+
+        /// Resolves each captured JNI fn_ptr to a module-relative offset and
+        /// writes per-module `jni_symbols_<module>.txt` (plus a raw dump) under
+        /// the output dir, ready to feed to `fixso --symbols`.
+        fn write_jni_symbols(&self) {
+            use std::fmt::Write;
+            let methods = self.jni_methods.read().unwrap().clone();
+            if methods.is_empty() {
+                return;
+            }
+
+            let mut mod_cache: HashMap<u32, Vec<crate::so::SoModule>> = HashMap::new();
+            let mut per_mod: HashMap<String, String> = HashMap::new();
+            let mut raw = String::new();
+            let mut seen: HashSet<(u32, u64)> = HashSet::new();
+
+            for m in &methods {
+                if !seen.insert((m.pid, m.fn_ptr)) {
+                    continue;
+                }
+                let _ = writeln!(raw, "{} 0x{:x} {} {}", m.pid, m.fn_ptr, m.name, m.sig);
+                let mods = mod_cache
+                    .entry(m.pid)
+                    .or_insert_with(|| modules_for_pid(m.pid));
+                for md in mods.iter() {
+                    if m.fn_ptr >= md.base && m.fn_ptr < md.end {
+                        let entry = per_mod.entry(md.name.clone()).or_default();
+                        let _ = writeln!(entry, "0x{:x} {}", m.fn_ptr - md.base, m.name);
+                        break;
+                    }
+                }
+            }
+
+            let raw_path = self.output_dir.join("jni_symbols_raw.txt");
+            if let Err(err) = fs::write(&raw_path, raw.as_bytes()) {
+                eprintln!("[jni] write {} failed: {err}", raw_path.display());
+            }
+            for (name, body) in &per_mod {
+                let path = self
+                    .output_dir
+                    .join(format!("jni_symbols_{}.txt", crate::so::sanitize_so_name(name)));
+                if let Err(err) = fs::write(&path, body.as_bytes()) {
+                    eprintln!("[jni] write {} failed: {err}", path.display());
+                }
+            }
+            println!(
+                "[+] Captured {} JNI method(s) across {} module(s); wrote jni_symbols_*.txt under {} (feed to: fixso --symbols)",
+                seen.len(),
+                per_mod.len(),
+                self.output_dir.display()
+            );
         }
 
         fn method_name(&self, begin: u64, method_idx: u32) -> String {
@@ -894,6 +985,29 @@ mod imp {
                     attached_art += 1;
                 }
             }
+            // JNI RegisterNatives: recover names for dynamically-registered
+            // native methods. Best-effort — skipped when the offset can't be
+            // located (symbol, or string xref on stripped ART).
+            match art::find_register_natives_offset(&config.libart, config.register_natives_offset)
+            {
+                Some(addr) => match attach_probe(
+                    &mut ebpf,
+                    "uprobe_libart_registerNatives",
+                    &config.libart,
+                    addr,
+                ) {
+                    Ok(()) => {
+                        attached_art += 1;
+                        println!("[+] JNI RegisterNatives hook enabled (libart offset 0x{addr:x})");
+                    }
+                    Err(err) => {
+                        eprintln!("[-] failed to attach RegisterNatives at 0x{addr:x}: {err:#}")
+                    }
+                },
+                None => {
+                    println!("[-] RegisterNatives offset not found in libart; JNI name recovery disabled")
+                }
+            }
         }
         if attached_art == 0 {
             anyhow::bail!(
@@ -953,6 +1067,10 @@ mod imp {
             ebpf.take_map("native_buffer_events")
                 .context("native_buffer_events map not found")?,
         )?;
+        let mut jni_events = RingBuf::try_from(
+            ebpf.take_map("jni_events")
+                .context("jni_events map not found")?,
+        )?;
 
         println!("eBPF DexDumper started successfully");
         while shutdown::keep_running() {
@@ -966,6 +1084,7 @@ mod imp {
             drain_ring(&mut native_buffer_events, |data| {
                 state.handle_native_buffer_event(data)
             });
+            drain_ring(&mut jni_events, |data| state.handle_jni_event(data));
             thread::sleep(Duration::from_millis(50));
         }
 
@@ -984,6 +1103,7 @@ mod imp {
         drain_ring(&mut native_buffer_events, |data| {
             state.handle_native_buffer_event(data)
         });
+        state.write_jni_symbols();
         state.flush_json()?;
         if config.auto_fix {
             println!("[+] Auto-fixing DEX files... (press Ctrl+C again to skip)");
@@ -1088,6 +1208,22 @@ mod imp {
             }
         }
         None
+    }
+
+    /// Lists the native modules mapped into `pid`, merging each library's
+    /// segments (and anonymous ELF images) so a JNI fn_ptr can be resolved to a
+    /// module-relative offset. Reuses the `so` module's grouping logic with a
+    /// process_vm_readv-backed ELF-magic probe.
+    fn modules_for_pid(pid: u32) -> Vec<crate::so::SoModule> {
+        let Ok(content) = fs::read_to_string(format!("/proc/{pid}/maps")) else {
+            return Vec::new();
+        };
+        let entries = crate::so::parse_map_entries(&content);
+        crate::so::group_so_modules(&entries, None, true, true, &|addr| {
+            read_remote_mem(pid, addr, 4)
+                .map(|b| b.starts_with(b"\x7fELF"))
+                .unwrap_or(false)
+        })
     }
 
     const DRAIN_BATCH_LIMIT: usize = 1024;
@@ -1279,6 +1415,38 @@ mod imp {
                 source: le32(data, 36)?,
             })
         }
+    }
+
+    // JNI RegisterNatives event: matches `struct jni_method_event_t` in bpf.
+    // Layout (with C alignment): pid@0, fn_ptr@8, name[96]@16, sig[96]@112.
+    const JNI_NAME_MAX: usize = 96;
+    const JNI_SIG_MAX: usize = 96;
+    const JNI_METHOD_EVENT_SIZE: usize = 16 + JNI_NAME_MAX + JNI_SIG_MAX;
+
+    struct JniMethodEvent {
+        pid: u32,
+        fn_ptr: u64,
+        name: String,
+        sig: String,
+    }
+
+    impl JniMethodEvent {
+        fn parse(data: &[u8]) -> Option<Self> {
+            if data.len() < JNI_METHOD_EVENT_SIZE {
+                return None;
+            }
+            Some(Self {
+                pid: le32(data, 0)?,
+                fn_ptr: le64(data, 8)?,
+                name: cstr_field(&data[16..16 + JNI_NAME_MAX]),
+                sig: cstr_field(&data[16 + JNI_NAME_MAX..16 + JNI_NAME_MAX + JNI_SIG_MAX]),
+            })
+        }
+    }
+
+    fn cstr_field(b: &[u8]) -> String {
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        String::from_utf8_lossy(&b[..end]).into_owned()
     }
 
     #[derive(Clone, Copy, Debug)]

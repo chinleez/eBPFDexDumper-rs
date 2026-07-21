@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use ebpf_dex_dumper_rs::{art, dump, fix, platform};
+use ebpf_dex_dumper_rs::{art, dump, fix, platform, so, so_fix};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -22,6 +22,10 @@ enum Command {
     Dump(DumpArgs),
     /// Fix dumped DEX files in a directory.
     Fix(FixArgs),
+    /// Dump native .so libraries from a running process's memory.
+    DumpSo(DumpSoArgs),
+    /// Fix dumped .so files in a directory for static-analysis tools.
+    FixSo(FixSoArgs),
     /// Locate ART interpreter hook targets in a libart.so ELF.
     Offsets(OffsetsArgs),
 }
@@ -80,6 +84,11 @@ struct DumpArgs {
     /// Debug fallback for ExecuteNterpImpl, decimal or 0x-prefixed hex.
     #[arg(long, value_parser = parse_u64)]
     nterp_offset: Option<u64>,
+
+    /// Manual offset for art::JNI<>::RegisterNatives (hex); auto-detected via
+    /// symbol or string xref when omitted.
+    #[arg(long, value_parser = parse_u64)]
+    register_natives_offset: Option<u64>,
 
     /// Override ART runtime layout offsets as ten comma-separated integers.
     #[arg(long, value_parser = parse_art_layout)]
@@ -149,6 +158,69 @@ struct FixArgs {
 }
 
 #[derive(Debug, Parser)]
+struct DumpSoArgs {
+    /// Filter by Android UID. Use either --uid or --name.
+    #[arg(short, long)]
+    uid: Option<u32>,
+
+    /// Android package name used to derive UID.
+    #[arg(short, long)]
+    name: Option<String>,
+
+    /// Only dump libraries whose path contains this substring (default: all).
+    #[arg(short, long)]
+    lib: Option<String>,
+
+    /// Output directory on target device.
+    #[arg(short, long, alias = "output", default_value = "/data/local/tmp/so_out")]
+    out: PathBuf,
+
+    /// Also scan anonymous memory regions for self-mapped ELF images.
+    #[arg(short, long, default_value_t = true)]
+    anon: bool,
+
+    /// Automatically fix dumped .so files after dumping.
+    #[arg(short = 'f', long, default_value_t = true)]
+    auto_fix: bool,
+
+    /// Disable anonymous ELF region scanning.
+    #[arg(long)]
+    no_anon: bool,
+
+    /// Disable automatic .so fixing.
+    #[arg(long)]
+    no_auto_fix: bool,
+
+    /// Also dump system libraries under /system, /apex, /vendor (default: skip).
+    #[arg(long)]
+    include_system: bool,
+
+    /// Keep watching the process and dump modules as they appear.
+    #[arg(short, long)]
+    watch: bool,
+
+    /// Seconds between map re-scans in --watch mode.
+    #[arg(long, default_value_t = 1)]
+    watch_interval: u64,
+
+    /// Stop --watch after N seconds (0 = until interrupted).
+    #[arg(long, default_value_t = 60)]
+    watch_timeout: u64,
+}
+
+#[derive(Debug, Parser)]
+struct FixSoArgs {
+    /// Directory containing dumped .so files.
+    #[arg(short, long)]
+    dir: PathBuf,
+
+    /// File of "offset name" lines to inject as .symtab symbols (e.g. recovered
+    /// JNI functions).
+    #[arg(short, long)]
+    symbols: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
 struct OffsetsArgs {
     /// Path to libart.so.
     #[arg(short, long)]
@@ -198,6 +270,55 @@ fn main() -> Result<()> {
                 force_mismatch: args.force_mismatch,
             },
         ),
+        Some(Command::DumpSo(args)) => {
+            let uid = match (args.uid, args.name.as_deref()) {
+                (Some(uid), _) if uid != 0 => uid,
+                (_, Some(pkg)) => {
+                    let uid = platform::lookup_uid_by_package_name(pkg)?;
+                    println!("[+] Resolved UID {uid} from package {pkg:?}");
+                    uid
+                }
+                _ => anyhow::bail!("either --uid or --name must be provided"),
+            };
+            let watch_timeout = (args.watch_timeout != 0)
+                .then(|| std::time::Duration::from_secs(args.watch_timeout));
+            let config = so::DumpSoConfig {
+                uid,
+                lib_filter: args.lib,
+                out: args.out,
+                include_anon: args.anon && !args.no_anon,
+                include_system: args.include_system,
+                auto_fix: args.auto_fix && !args.no_auto_fix,
+                watch: args.watch,
+                watch_interval: std::time::Duration::from_secs(args.watch_interval),
+                watch_timeout,
+            };
+            so::run(config)
+        }
+        Some(Command::FixSo(args)) => {
+            let (injected, target) = match args.symbols.as_deref() {
+                Some(sf) => {
+                    let syms = so_fix::parse_symbol_file(sf)?;
+                    let target = so_fix::module_stem_from_symbols_file(sf);
+                    if target.is_empty() {
+                        println!(
+                            "[+] Loaded {} symbol(s) from {}; couldn't infer target module, will inject into every .so",
+                            syms.len(),
+                            sf.display()
+                        );
+                    } else {
+                        println!(
+                            "[+] Loaded {} symbol(s) from {} (target module {target:?})",
+                            syms.len(),
+                            sf.display()
+                        );
+                    }
+                    (syms, target)
+                }
+                None => (Vec::new(), String::new()),
+            };
+            so_fix::fix_so_directory(&args.dir, &injected, &target)
+        }
         Some(Command::Offsets(args)) => {
             let targets = if args.json {
                 art::find_art_offsets_quiet(&args.libart, args.execute_offset, args.nterp_offset)
@@ -288,6 +409,7 @@ fn main() -> Result<()> {
                 auto_fix,
                 execute_offset: args.execute_offset,
                 nterp_offset: args.nterp_offset,
+                register_natives_offset: args.register_natives_offset,
                 runtime_layout: args.art_layout,
                 debug_layout: args.debug_layout,
                 code_item_fallback: !args.no_code_item_fallback,

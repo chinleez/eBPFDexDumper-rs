@@ -1,6 +1,10 @@
 use std::fmt;
 
 pub const DEX_FILE_MAGIC: u32 = 0x0a78_6564;
+/// "cdex" — ART's CompactDex. These files use a compressed CodeItem layout and
+/// shared data, so they need a cdex->dex conversion before standard DEX tooling
+/// (including this dumper) can read them.
+pub const COMPACT_DEX_FILE_MAGIC: u32 = 0x7865_6463;
 pub const DEX_HEADER_SIZE: usize = 0x70;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +40,10 @@ pub enum DexError {
     TooSmall,
     #[error("invalid dex magic: {0:x}")]
     InvalidMagic(u32),
+    #[error(
+        "CompactDex (cdex) detected: this tool emits standard DEX; convert cdex->dex first (e.g. vdexExtractor) — see README"
+    )]
+    CompactDex,
     #[error("{0} out of bounds")]
     OutOfBounds(&'static str),
     #[error("{kind} index out of bounds: {idx}")]
@@ -72,6 +80,9 @@ impl<'a> DexParser<'a> {
                 .try_into()
                 .map_err(|_| DexError::TooSmall)?,
         );
+        if magic == COMPACT_DEX_FILE_MAGIC {
+            return Err(DexError::CompactDex);
+        }
         if magic != DEX_FILE_MAGIC {
             return Err(DexError::InvalidMagic(magic));
         }
@@ -432,6 +443,15 @@ fn le32(data: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_dex_magic_is_detected() {
+        // A cdex header is at least DEX_HEADER_SIZE bytes; only the leading
+        // magic matters for detection.
+        let mut data = vec![0u8; DEX_HEADER_SIZE];
+        data[..4].copy_from_slice(b"cdex");
+        assert!(matches!(DexParser::new(&data), Err(DexError::CompactDex)));
+    }
 
     #[test]
     fn uleb128_reads_multibyte_values() {

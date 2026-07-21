@@ -10,8 +10,10 @@
 
 ## 功能
 
-- `dump`：通过 ART 入口、DexFile 注册/构造、CodeItem 反扫、maps 扫描和 native buffer 扫描捕获 DEX。
+- `dump`：通过 ART 入口、DexFile 注册/构造、CodeItem 反扫、maps 扫描和 native buffer 扫描捕获 DEX；若能定位 `RegisterNatives`，同时捕获动态注册的 JNI 方法名，写入 `jni_symbols_*.txt`。
 - `fix`：把记录到的方法字节码回填到 DEX，修复版保留在 `fix/`，最终可用结果汇总到 `final/`。
+- `dumpso`：从运行进程内存 dump native `.so`（读 `/proc/<pid>/maps` 合并各段后用 `process_vm_readv` 读出，不走 eBPF）。支持匿名 ELF 扫描、`--watch` 抓运行时脱壳、系统库过滤，默认 dump 后自动 `fixso`。
+- `fixso`：修复 dump 出的 `.so`，让 IDA/Ghidra 能加载——归正段偏移，并从 `PT_DYNAMIC` 重建完整 section header table（`.dynsym`/重定位/hash/version 等）；`--symbols` 可把恢复的符号（如 JNI 名）注入真实 `.symtab`。
 - `offsets`：从 `libart.so` 定位 hook 目标，必要时可手动指定 ART layout。
 
 ## 环境
@@ -36,6 +38,10 @@ su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
 su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app --force-mismatch
+su -c './eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out'
+su -c './eBPFDexDumper dumpso -n com.example.app --watch --watch-timeout 120'
+./eBPFDexDumper fixso -d /data/local/tmp/so_out
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/com.example.app/jni_symbols_libfoo.txt
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
 ```
@@ -67,6 +73,26 @@ su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 ### 实验选项
 
 `--native-elf-scan` 会复用 libc `mmap`/`mprotect` 事件识别匿名可执行 ARM64 ELF 候选块，并保存到输出子目录的 `native_elf/`。它只作为隐藏 native loader 行为的辅助排查，不影响默认 DEX dump 和回填流程。
+
+### native `.so` dump 与修复（`dumpso` / `fixso`）
+
+`dumpso` 读 `/proc/<pid>/maps`，把每个库分开映射的段（`r--`/`r-x`/`rw-`）按虚拟地址合并成连续区间，用 `process_vm_readv` 整段读出——这条路径**不依赖 eBPF/uprobe**。默认还会扫描匿名、无路径、首页是 ELF magic 的内存区，以捕获壳自己 map/解密、没走 linker 的库。文件命名 `so_<pid>_<base>_<size>_<name>.so`。
+
+- `--watch`：持续轮询 maps，新模块出现即 dump；采样内容变化时按上限重新 dump，用来抓运行时原地解密的库（`--watch-interval` 默认 1s、`--watch-timeout` 默认 60s，0 表示直到 Ctrl-C）。
+- 默认跳过 `/system`、`/apex`、`/vendor`、`/system_ext`、`/product`、`/odm` 下的系统库（这些可直接从设备镜像取），`--include-system` 恢复；`--lib <substr>` 只 dump 路径含该子串的库。
+- `--no-anon` 关闭匿名扫描；`dumpso` 默认在 dump 后自动跑 `fixso`（`--no-auto-fix` 关闭）。
+
+`fixso` 修复 dump 出的 `.so`：优先从 `PT_DYNAMIC` 重建完整 section header table（`.dynsym`/`.dynstr`/`.hash`/`.gnu.hash`/各类重定位/version/`.init_array` 等，SoFixer 思路，支持 ELF32/64 与 Android packed relocation），无 `PT_DYNAMIC` 时退回最小修复（归正 `p_offset`、抬 `p_filesz`、清零段表）。修复结果写入 `dir/fix/<stem>_fix.so`。
+
+### JNI 名称恢复（`RegisterNatives`）
+
+动态注册的 native 方法在 `.so` 里没有导出符号，IDA 只显示 `sub_XXXX`。`dump` 时若能在 `libart` 定位 `art::JNI<>::RegisterNatives`（符号表；被 strip 时用函数体内嵌的 AOSP 警告字符串做交叉引用回溯），会 hook 它并遍历 `JNINativeMethod` 数组，把 `{fn_ptr, name, sig}` 写入输出目录的 `jni_symbols_<module>.txt`（及 `jni_symbols_raw.txt`）。
+
+把该文件交给 `fixso --symbols`（`-s`），恢复的名字会作为真实 `.symtab` 符号注入到名字匹配的那个 `.so`，IDA/Ghidra 里即可看到函数名。可用 `--register-natives-offset` 手动指定偏移。完整闭环：`dump`（拿 JNI 名）→ `dumpso`（拿 `.so`）→ `fixso -s`（注入）。
+
+### CompactDex（cdex）
+
+遇到 ART 的 CompactDex（`cdex` magic）会给出明确诊断而不是当作损坏 DEX。本工具只产出标准 DEX，cdex 需要先做 cdex→dex 转换（如 vdexExtractor）才能被标准工具读取。
 
 ---
 

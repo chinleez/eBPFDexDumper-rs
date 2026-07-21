@@ -11,6 +11,18 @@
 
 #define RINGBUF_SIZE (1 << 17)   // 128KB per chunk
 
+// One event per JNI native method seen at RegisterNatives. User space maps
+// fn_ptr back to a module offset and injects `name` as a .symtab symbol via
+// fixso, so dynamically-registered JNI functions show real names in IDA.
+#define JNI_NAME_MAX 96
+#define JNI_SIG_MAX  96
+struct jni_method_event_t {
+    u32 pid;
+    u64 fn_ptr;               // runtime address of the native function
+    char name[JNI_NAME_MAX];  // Java method name
+    char sig[JNI_SIG_MAX];    // JNI type signature
+};
+
 struct config_t{
 	uid_t uid;
 	pid_t pid;
@@ -129,6 +141,12 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 20);
 } native_buffer_events SEC(".maps");
+
+// Ring buffer for JNI RegisterNatives captures
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} jni_events SEC(".maps");
 
 // Config map
 struct

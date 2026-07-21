@@ -660,6 +660,229 @@ fn check_for_6th_parameter(code_data: &[u8], code_vaddr: u64, func_addr: u64) ->
     false
 }
 
+// AOSP warning strings that live inside art::JNI<>::RegisterNatives
+// (runtime/jni/jni_internal.cc). The "slow" string is unique to RegisterNatives
+// and survives stripping; the zero-methods string is the fallback.
+const REG_NATIVES_SLOW_STR: &[u8] = b"This is slow, consider changing your RegisterNatives calls.";
+const REG_NATIVES_ZERO_STR: &[u8] =
+    b"JNI RegisterNativeMethods: attempt to register 0 native methods for ";
+
+/// Locates `art::JNI<>::RegisterNatives` in libart. Returns `None` if it can't
+/// be found, in which case JNI name recovery is simply skipped.
+///
+/// Lookup order: manual offset -> symbol/dynsym (prefer JNI<false>/`Lb0E` over
+/// the CheckJNI `<true>` instantiation) -> string xref (modern stripped ART no
+/// longer exports RegisterNatives but still embeds the AOSP warning strings
+/// inside the function body).
+pub fn find_register_natives_offset(libart_path: &Path, manual: Option<u64>) -> Option<u64> {
+    if let Some(m) = manual.filter(|m| *m != 0) {
+        println!("[+] Using manual RegisterNatives offset: 0x{m:x}");
+        return Some(m);
+    }
+    let bytes = fs::read(libart_path).ok()?;
+    let elf = Elf::parse(&bytes).ok()?;
+    if let Some(off) = find_register_natives_by_symbol(&elf) {
+        println!("[+] RegisterNatives found by symbol at 0x{off:x}");
+        return Some(off);
+    }
+    match find_register_natives_by_string(&elf, &bytes) {
+        Ok(off) => {
+            println!("[+] RegisterNatives found by string xref at 0x{off:x}");
+            Some(off)
+        }
+        Err(err) => {
+            eprintln!("[-] RegisterNatives string xref failed: {err:#}");
+            None
+        }
+    }
+}
+
+fn find_register_natives_by_symbol(elf: &Elf<'_>) -> Option<u64> {
+    fn scan(
+        it: impl Iterator<Item = goblin::elf::Sym>,
+        strtab: &goblin::strtab::Strtab,
+    ) -> Option<u64> {
+        // Modern ART defines the JNI entrypoints as template<bool kEnableIndexIds>
+        // class JNI, so two symbols match: art::JNI<false> (...3JNIILb0EE..., the
+        // table the runtime dispatches to) and art::JNI<true> (...ILb1EE..., the
+        // CheckJNI variant). Prefer the <false> (Lb0E) one; fall back to any match.
+        let mut fallback = None;
+        for sym in it {
+            if sym.st_value == 0 {
+                continue;
+            }
+            let Some(name) = strtab.get_at(sym.st_name) else {
+                continue;
+            };
+            if name.contains("3art") && name.contains("3JNI") && name.contains("15RegisterNatives")
+            {
+                if name.contains("Lb0E") {
+                    return Some(sym.st_value);
+                }
+                if fallback.is_none() {
+                    fallback = Some(sym.st_value);
+                }
+            }
+        }
+        fallback
+    }
+    scan(elf.syms.iter(), &elf.strtab).or_else(|| scan(elf.dynsyms.iter(), &elf.dynstrtab))
+}
+
+fn find_register_natives_by_string(elf: &Elf<'_>, bytes: &[u8]) -> Result<u64> {
+    // Prefer the slow-warning string; fall back to the zero-methods warning.
+    let str_addr = [REG_NATIVES_SLOW_STR, REG_NATIVES_ZERO_STR]
+        .into_iter()
+        .find_map(|s| find_string_in_elf(elf, bytes, s).ok())
+        .context("RegisterNatives warning strings not found in libart")?;
+
+    let (code_vaddr, code_data) = executable_load_segments(elf)
+        .find_map(|ph| segment_data(bytes, ph).ok().map(|data| (ph.p_vaddr, data)))
+        .context("code segment not found")?;
+
+    let ref_addrs = find_arm64_string_refs(code_data, code_vaddr, str_addr, 6);
+    if ref_addrs.is_empty() {
+        anyhow::bail!("no code references to RegisterNatives string found");
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for ref_addr in ref_addrs {
+        if let Some(entry) = find_function_entry(code_data, code_vaddr, ref_addr) {
+            if seen.insert(entry) {
+                candidates.push(entry);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        anyhow::bail!("could not recover function entry from RegisterNatives string refs");
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates[0]);
+    }
+
+    // Two instantiations (default JNI vs CheckJNI). Prefer the one parked in a
+    // JNINativeInterface-like table: a RW qword equal to the entry whose next
+    // qword is also an executable pointer (UnregisterNatives sits right after).
+    if let Some(pick) =
+        prefer_register_natives_in_jni_table(elf, bytes, code_vaddr, code_data.len() as u64, &candidates)
+    {
+        return Ok(pick);
+    }
+    // Stable fallback: lowest address is normally the default (non-CheckJNI) impl.
+    candidates.sort_unstable();
+    Ok(candidates[0])
+}
+
+/// Returns the PCs of ADR / ADRP(+ADD) sequences that materialize `str_addr`.
+/// `adrp_lookahead` bounds how many instructions after an ADRP are scanned for
+/// the paired ADD (upstream today's `findArm64StringRefs`).
+fn find_arm64_string_refs(
+    code_data: &[u8],
+    code_vaddr: u64,
+    str_addr: u64,
+    adrp_lookahead: usize,
+) -> Vec<u64> {
+    let mut refs = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= code_data.len() {
+        let pc = code_vaddr + i as u64;
+        let inst = read_inst(code_data, i);
+
+        // ADRP Xd, page
+        if (inst & 0x9f00_0000) == 0x9000_0000 {
+            let immlo = (inst >> 29) & 0x3;
+            let immhi = (inst >> 5) & 0x7ffff;
+            let mut imm = (((immhi << 2) | immlo) as i64) << 12;
+            if (imm & (1 << 32)) != 0 {
+                imm |= !0i64 << 33;
+            }
+            let page_addr = (pc & !0xfff).wrapping_add(imm as u64);
+            let rd = inst & 0x1f;
+            // Look ahead for ADD Xd, Xd, #imm12 (optionally LSL #12).
+            for j in 1..=adrp_lookahead {
+                let off = i + j * 4;
+                if off + 4 > code_data.len() {
+                    break;
+                }
+                let next = read_inst(code_data, off);
+                if (next & 0xff80_0000) != 0x9100_0000 {
+                    continue;
+                }
+                if (next >> 5) & 0x1f != rd {
+                    continue;
+                }
+                let imm12 = (next >> 10) & 0xfff;
+                let addend = if (next >> 22) & 1 != 0 {
+                    (imm12 as u64) << 12
+                } else {
+                    imm12 as u64
+                };
+                if page_addr + addend == str_addr {
+                    refs.push(pc);
+                    break;
+                }
+            }
+        }
+
+        // ADR Xd, label
+        if (inst & 0x9f00_0000) == 0x1000_0000 {
+            let immlo = (inst >> 29) & 0x3;
+            let immhi = (inst >> 5) & 0x7ffff;
+            let mut imm = ((immhi << 2) | immlo) as i64;
+            if (imm & (1 << 20)) != 0 {
+                imm |= !0i64 << 21;
+            }
+            if pc.wrapping_add(imm as u64) == str_addr {
+                refs.push(pc);
+            }
+        }
+        i += 4;
+    }
+    refs
+}
+
+/// Picks the candidate whose address appears as a function pointer in a RW LOAD
+/// segment with an executable neighbor at +8 (UnregisterNatives) — the layout
+/// of JNINativeInterface.
+fn prefer_register_natives_in_jni_table(
+    elf: &Elf<'_>,
+    bytes: &[u8],
+    code_vaddr: u64,
+    code_size: u64,
+    candidates: &[u64],
+) -> Option<u64> {
+    let code_end = code_vaddr + code_size;
+    let in_exec = |va: u64| va >= code_vaddr && va < code_end;
+
+    let mut hits = Vec::new();
+    for ph in elf
+        .program_headers
+        .iter()
+        .filter(|ph| ph.p_type == program_header::PT_LOAD && (ph.p_flags & program_header::PF_W) != 0)
+    {
+        let Ok(data) = segment_data(bytes, ph) else {
+            continue;
+        };
+        if data.len() < 16 {
+            continue;
+        }
+        let mut off = 0usize;
+        while off + 16 <= data.len() {
+            let ptr = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            if candidates.contains(&ptr) {
+                let next = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+                if in_exec(next) {
+                    hits.push(ptr);
+                }
+            }
+            off += 8;
+        }
+    }
+    hits.sort_unstable();
+    hits.first().copied()
+}
+
 fn find_nterp_with_clinit_by_branch(
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -808,6 +1031,26 @@ mod tests {
             ..Default::default()
         };
         assert!(targets.has_main_entry());
+    }
+
+    #[test]
+    fn arm64_string_refs_matches_adrp_add() {
+        // adrp x0, page(0x5000) from pc 0x1000; add x0, x0, #0x678 -> 0x5678.
+        let mut code = vec![0u8; 0x10];
+        code[0..4].copy_from_slice(&0x9000_0020u32.to_le_bytes());
+        code[4..8].copy_from_slice(&0x9119_e000u32.to_le_bytes());
+        assert_eq!(find_arm64_string_refs(&code, 0x1000, 0x5678, 6), vec![0x1000]);
+        // Wrong target address yields no reference.
+        assert!(find_arm64_string_refs(&code, 0x1000, 0x5679, 6).is_empty());
+    }
+
+    #[test]
+    fn arm64_string_refs_matches_adr() {
+        // adr x1, +0x40 from pc 0x2000 -> 0x2040.
+        let inst = 0x1000_0000u32 | (0x40 >> 2 << 5) | ((0x40 & 0x3) << 29) | 1;
+        let mut code = vec![0u8; 8];
+        code[0..4].copy_from_slice(&inst.to_le_bytes());
+        assert_eq!(find_arm64_string_refs(&code, 0x2000, 0x2040, 6), vec![0x2000]);
     }
 
     #[test]

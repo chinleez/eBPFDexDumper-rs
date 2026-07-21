@@ -11,6 +11,7 @@ const struct dex_chunk_event_t *unused_dex_chunk_event_t __attribute__((unused))
 const struct dex_read_failure_t *unused_dex_read_failure_t __attribute__((unused));
 const struct layout_debug_event_t *unused_layout_debug_event_t __attribute__((unused));
 const struct native_buffer_event_t *unused_native_buffer_event_t __attribute__((unused));
+const struct jni_method_event_t *unused_jni_method_event_t __attribute__((unused));
 
 #define DEFAULT_SHADOW_FRAME_METHOD_OFFSET 0x08
 #define DEFAULT_ART_METHOD_DECLARING_CLASS_OFFSET 0x00
@@ -900,6 +901,68 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
 
         // submit dex chunks progressively via ringbuf
         submit_dex_chunks_partial(begin, pid, size);
+    }
+    return 0;
+}
+
+#define JNI_NATIVE_METHOD_SIZE 24
+#define JNI_MAX_METHODS 512
+
+// uprobe on art::JNI<>::RegisterNatives(JNIEnv*, jclass, const JNINativeMethod*,
+// jint). Walks the methods array and emits {fn_ptr, name, sig} for each, so user
+// space can recover names for dynamically-registered JNI functions (which carry
+// no export symbol in the .so). The class pointer (PARM2) is deliberately not
+// dereferenced: resolving it needs version-specific ART mirror layout, whereas
+// the JNINativeMethod fields are plain C strings/pointers.
+SEC("uprobe/libart_registerNatives")
+int uprobe_libart_registerNatives(struct pt_regs *ctx)
+{
+    // Use the TGID (process id), not the low-32 TID: user space resolves fn_ptr
+    // against /proc/<pid>/maps later, at Stop. A registering worker thread may
+    // have exited by then, but the thread-group leader lives for the whole
+    // process and shares the same address space.
+    u32 pid = current_tgid();
+    struct config_t *conf = get_config();
+    if (!trace_allowed(conf, pid, bpf_get_current_uid_gid())) {
+        return 0;
+    }
+
+    unsigned char *methods = (unsigned char *)PT_REGS_PARM3(ctx);
+    int count = (int)PT_REGS_PARM4(ctx);
+    if (methods == 0 || count <= 0) {
+        return 0;
+    }
+    if (count > JNI_MAX_METHODS) {
+        count = JNI_MAX_METHODS;
+    }
+
+    for (int i = 0; i < count && i < JNI_MAX_METHODS; i++) {
+        unsigned char *entry = methods + (long)i * JNI_NATIVE_METHOD_SIZE;
+        u64 name_ptr = 0, sig_ptr = 0, fn_ptr = 0;
+        bpf_probe_read_user(&name_ptr, sizeof(u64), entry + 0);
+        bpf_probe_read_user(&sig_ptr, sizeof(u64), entry + 8);
+        bpf_probe_read_user(&fn_ptr, sizeof(u64), entry + 16);
+        if (fn_ptr == 0) {
+            continue;
+        }
+        struct jni_method_event_t *e = (struct jni_method_event_t *)bpf_ringbuf_reserve(
+            &jni_events, sizeof(struct jni_method_event_t), 0);
+        if (!e) {
+            continue;
+        }
+        // bpf_ringbuf_reserve does not zero the record; clear it so bytes after
+        // each string's NUL aren't stale ring-buffer contents leaked to user
+        // space (and a failed read_user_str leaves a clean empty string).
+        __builtin_memset(e, 0, sizeof(*e));
+        e->pid = pid;
+        e->fn_ptr = fn_ptr;
+        if (name_ptr) {
+            bpf_probe_read_user_str(e->name, sizeof(e->name), (void *)name_ptr);
+        }
+        if (sig_ptr) {
+            bpf_probe_read_user_str(e->sig, sizeof(e->sig), (void *)sig_ptr);
+        }
+        bpf_ringbuf_submit(e, 0);
     }
     return 0;
 }

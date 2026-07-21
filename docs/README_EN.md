@@ -10,8 +10,10 @@ An eBPF DEX dumper for rooted Android 13-17 ARM64 devices. It captures DEX data 
 
 ## Features
 
-- `dump`: captures DEX through ART entries, DexFile registration/construction, CodeItem backscan, maps scan, and native buffer scan.
+- `dump`: captures DEX through ART entries, DexFile registration/construction, CodeItem backscan, maps scan, and native buffer scan. When `RegisterNatives` can be located, it also captures dynamically-registered JNI method names into `jni_symbols_*.txt`.
 - `fix`: writes recorded method bytecode back into DEX files, keeps repaired copies under `fix/`, and gathers usable outputs under `final/`.
+- `dumpso`: dumps native `.so` libraries from a running process's memory (reads `/proc/<pid>/maps`, merges each library's segments, and reads them out with `process_vm_readv` — no eBPF involved). Supports anonymous-ELF scanning, `--watch` for runtime-unpacked libraries, and system-library filtering; auto-runs `fixso` after dumping by default.
+- `fixso`: repairs dumped `.so` files so IDA/Ghidra can load them — normalizes segment offsets and rebuilds a full section header table from `PT_DYNAMIC` (`.dynsym`, relocations, hash, version, ...). `--symbols` injects recovered symbols (e.g. JNI names) into a real `.symtab`.
 - `offsets`: resolves hook targets from `libart.so`; manual ART layout is supported when needed.
 
 ## Requirements
@@ -50,6 +52,12 @@ su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
 
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app --force-mismatch
+
+su -c './eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out'
+su -c './eBPFDexDumper dumpso -n com.example.app --watch --watch-timeout 120'
+./eBPFDexDumper fixso -d /data/local/tmp/so_out
+./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/com.example.app/jni_symbols_libfoo.txt
+
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
 ```
@@ -115,6 +123,26 @@ The default ART layout targets common Android 13+ layouts. Use `--art-layout` wh
 ### Experimental options
 
 `--native-elf-scan` reuses libc `mmap`/`mprotect` events to identify anonymous executable ARM64 ELF candidates and saves them under `native_elf/` in the target output directory. It is an auxiliary diagnostic path for hidden native loaders and does not change the default DEX dump or fix flow.
+
+### Native `.so` dump and repair (`dumpso` / `fixso`)
+
+`dumpso` reads `/proc/<pid>/maps`, merges each library's separately mapped segments (`r--`/`r-x`/`rw-`) back into one contiguous span by virtual address, and reads it out with `process_vm_readv` — this path does **not** use eBPF/uprobes. It also scans anonymous, path-less regions whose first page starts with the ELF magic, to catch libraries a packer mapped/decrypted itself. Files are named `so_<pid>_<base>_<size>_<name>.so`.
+
+- `--watch`: keep polling maps and dump each new/changed module as it appears (re-dumps up to a cap when sampled contents change), to capture runtime-decrypted libraries (`--watch-interval` default 1s, `--watch-timeout` default 60s, 0 = until Ctrl-C).
+- System libraries under `/system`, `/apex`, `/vendor`, `/system_ext`, `/product`, `/odm` are skipped by default; `--include-system` restores them. `--lib <substr>` dumps only libraries whose path contains the substring.
+- `--no-anon` disables anonymous scanning; `dumpso` auto-runs `fixso` after dumping (`--no-auto-fix` to disable).
+
+`fixso` prefers rebuilding a full section header table from `PT_DYNAMIC` (`.dynsym`/`.dynstr`/`.hash`/`.gnu.hash`/relocations/version/`.init_array`, ..., SoFixer-style, ELF32/64 and Android packed relocations), and falls back to a minimal fix (normalize `p_offset`, raise `p_filesz`, zero the section header table) when there is no `PT_DYNAMIC`. Results are written to `dir/fix/<stem>_fix.so`.
+
+### JNI name recovery (`RegisterNatives`)
+
+Dynamically-registered native methods carry no export symbol, so IDA shows only `sub_XXXX`. During `dump`, when `art::JNI<>::RegisterNatives` can be located in `libart` (by symbol, or — on stripped builds — by cross-referencing the AOSP warning string embedded in the function body), it is hooked and its `JNINativeMethod` array is walked, writing `{fn_ptr, name, sig}` to `jni_symbols_<module>.txt` (and `jni_symbols_raw.txt`) in the output directory.
+
+Feed that file to `fixso --symbols` (`-s`): the recovered names are injected as real `.symtab` symbols into the matching `.so`, so IDA/Ghidra show function names. Use `--register-natives-offset` to set the offset manually. Full loop: `dump` (JNI names) → `dumpso` (the `.so`) → `fixso -s` (inject).
+
+### CompactDex (cdex)
+
+ART's CompactDex (`cdex` magic) is reported with a clear diagnostic instead of being treated as a corrupt DEX. This tool emits standard DEX only; a cdex→dex conversion (e.g. vdexExtractor) is needed first before standard tooling can read it.
 
 ## License
 
