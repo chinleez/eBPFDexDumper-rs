@@ -764,9 +764,13 @@ fn find_register_natives_by_string(elf: &Elf<'_>, bytes: &[u8]) -> Result<u64> {
     // Two instantiations (default JNI vs CheckJNI). Prefer the one parked in a
     // JNINativeInterface-like table: a RW qword equal to the entry whose next
     // qword is also an executable pointer (UnregisterNatives sits right after).
-    if let Some(pick) =
-        prefer_register_natives_in_jni_table(elf, bytes, code_vaddr, code_data.len() as u64, &candidates)
-    {
+    if let Some(pick) = prefer_register_natives_in_jni_table(
+        elf,
+        bytes,
+        code_vaddr,
+        code_data.len() as u64,
+        &candidates,
+    ) {
         return Ok(pick);
     }
     // Stable fallback: lowest address is normally the default (non-CheckJNI) impl.
@@ -856,11 +860,9 @@ fn prefer_register_natives_in_jni_table(
     let in_exec = |va: u64| va >= code_vaddr && va < code_end;
 
     let mut hits = Vec::new();
-    for ph in elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == program_header::PT_LOAD && (ph.p_flags & program_header::PF_W) != 0)
-    {
+    for ph in elf.program_headers.iter().filter(|ph| {
+        ph.p_type == program_header::PT_LOAD && (ph.p_flags & program_header::PF_W) != 0
+    }) {
         let Ok(data) = segment_data(bytes, ph) else {
             continue;
         };
@@ -1039,7 +1041,10 @@ mod tests {
         let mut code = vec![0u8; 0x10];
         code[0..4].copy_from_slice(&0x9000_0020u32.to_le_bytes());
         code[4..8].copy_from_slice(&0x9119_e000u32.to_le_bytes());
-        assert_eq!(find_arm64_string_refs(&code, 0x1000, 0x5678, 6), vec![0x1000]);
+        assert_eq!(
+            find_arm64_string_refs(&code, 0x1000, 0x5678, 6),
+            vec![0x1000]
+        );
         // Wrong target address yields no reference.
         assert!(find_arm64_string_refs(&code, 0x1000, 0x5679, 6).is_empty());
     }
@@ -1050,7 +1055,10 @@ mod tests {
         let inst = 0x1000_0000u32 | (0x40 >> 2 << 5) | ((0x40 & 0x3) << 29) | 1;
         let mut code = vec![0u8; 8];
         code[0..4].copy_from_slice(&inst.to_le_bytes());
-        assert_eq!(find_arm64_string_refs(&code, 0x2000, 0x2040, 6), vec![0x2000]);
+        assert_eq!(
+            find_arm64_string_refs(&code, 0x2000, 0x2040, 6),
+            vec![0x2000]
+        );
     }
 
     #[test]

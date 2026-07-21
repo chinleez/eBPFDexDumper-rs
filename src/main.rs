@@ -172,7 +172,12 @@ struct DumpSoArgs {
     lib: Option<String>,
 
     /// Output directory on target device.
-    #[arg(short, long, alias = "output", default_value = "/data/local/tmp/so_out")]
+    #[arg(
+        short,
+        long,
+        alias = "output",
+        default_value = "/data/local/tmp/so_out"
+    )]
     out: PathBuf,
 
     /// Also scan anonymous memory regions for self-mapped ELF images.

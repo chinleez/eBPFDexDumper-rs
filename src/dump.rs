@@ -543,10 +543,9 @@ mod imp {
                 // and we don't leave half-truncated files on disk. CompactDex
                 // gets its own line so it doesn't read as a corruption bug.
                 match err {
-                    DexError::CompactDex => eprintln!(
-                        "Skip CompactDex 0x{begin:x} ({} bytes): {err}",
-                        bytes.len()
-                    ),
+                    DexError::CompactDex => {
+                        eprintln!("Skip CompactDex 0x{begin:x} ({} bytes): {err}", bytes.len())
+                    }
                     _ => eprintln!(
                         "Skip malformed dex 0x{begin:x} ({} bytes): {err}",
                         bytes.len()
@@ -643,9 +642,10 @@ mod imp {
                 eprintln!("[jni] write {} failed: {err}", raw_path.display());
             }
             for (name, body) in &per_mod {
-                let path = self
-                    .output_dir
-                    .join(format!("jni_symbols_{}.txt", crate::so::sanitize_so_name(name)));
+                let path = self.output_dir.join(format!(
+                    "jni_symbols_{}.txt",
+                    crate::so::sanitize_so_name(name)
+                ));
                 if let Err(err) = fs::write(&path, body.as_bytes()) {
                     eprintln!("[jni] write {} failed: {err}", path.display());
                 }

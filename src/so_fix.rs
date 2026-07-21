@@ -282,7 +282,16 @@ impl ElfLayout {
 
     /// Writes one symbol table entry in the right class layout.
     #[allow(clippy::too_many_arguments)]
-    fn put_sym(self, b: &mut [u8], name: u32, value: u64, size: u64, info: u8, other: u8, shndx: u16) {
+    fn put_sym(
+        self,
+        b: &mut [u8],
+        name: u32,
+        value: u64,
+        size: u64,
+        info: u8,
+        other: u8,
+        shndx: u16,
+    ) {
         if self.is64 {
             wr_u32(b, 0, name);
             b[4] = info;
@@ -1133,7 +1142,9 @@ pub fn fix_one_so(so_path: &Path, out_path: &Path, injected: &[InjectedSym]) -> 
     if data[4] != 1 && data[4] != 2 {
         anyhow::bail!("unsupported EI_CLASS={} (want ELF32 or ELF64)", data[4]);
     }
-    let base = out_path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let base = out_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
     let base = base.as_deref().unwrap_or("?");
 
     // Preferred path: rebuild the section header table from the dynamic segment.
@@ -1151,7 +1162,9 @@ pub fn fix_one_so(so_path: &Path, out_path: &Path, injected: &[InjectedSym]) -> 
             return Ok(());
         }
         Err(e) => {
-            let src = so_path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let src = so_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
             println!(
                 "[fixso] section rebuild unavailable for {} ({e}); falling back to header-only fix",
                 src.as_deref().unwrap_or("?")
@@ -1221,12 +1234,13 @@ pub fn fix_so_directory(dir: &Path, injected: &[InjectedSym], symbols_target: &s
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
 
         // Route the symbol map only to its own library.
-        let syms: &[InjectedSym] =
-            if !injected.is_empty() && (symbols_target.is_empty() || so_matches_module(&name, symbols_target)) {
-                injected
-            } else {
-                &[]
-            };
+        let syms: &[InjectedSym] = if !injected.is_empty()
+            && (symbols_target.is_empty() || so_matches_module(&name, symbols_target))
+        {
+            injected
+        } else {
+            &[]
+        };
 
         let stem = name.strip_suffix(".so").unwrap_or(&name);
         let out_path = fix_dir.join(format!("{stem}_fix.so"));
@@ -1339,7 +1353,10 @@ mod tests {
         assert!(so_matches_module("so_1234_7f00_2000_libfoo.so", "libfoo"));
         assert!(so_matches_module("libfoo.so", "libfoo"));
         assert!(!so_matches_module("libbar.so", "libfoo"));
-        assert_eq!(module_stem_from_symbols_file(Path::new("jni_symbols_libfoo.txt")), "libfoo");
+        assert_eq!(
+            module_stem_from_symbols_file(Path::new("jni_symbols_libfoo.txt")),
+            "libfoo"
+        );
         assert_eq!(module_stem_from_symbols_file(Path::new("other.txt")), "");
     }
 
@@ -1414,7 +1431,7 @@ mod tests {
         wr_u64(&mut img, ph0 + 16, 0); // p_vaddr
         wr_u64(&mut img, ph0 + 32, 0x2000); // p_filesz
         wr_u64(&mut img, ph0 + 40, 0x2000); // p_memsz
-        // PT_DYNAMIC
+                                            // PT_DYNAMIC
         let ph1 = 64 + 56;
         wr_u32(&mut img, ph1, PT_DYNAMIC);
         wr_u32(&mut img, ph1 + 4, 6); // PF_R|PF_W

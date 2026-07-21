@@ -217,8 +217,8 @@ pub(crate) fn group_so_modules(
 #[cfg(any(target_os = "android", target_os = "linux"))]
 mod imp {
     use super::*;
-    use anyhow::{Context, Result};
     use crate::shutdown::keep_running;
+    use anyhow::{Context, Result};
     use std::collections::HashMap;
     use std::fs;
     use std::hash::Hasher;
@@ -466,7 +466,10 @@ mod imp {
                     fresh.push(m);
                 }
                 if !fresh.is_empty() {
-                    println!("[so-watch] pid {pid}: {} new/changed module(s)", fresh.len());
+                    println!(
+                        "[so-watch] pid {pid}: {} new/changed module(s)",
+                        fresh.len()
+                    );
                     written.extend(dump_so_modules(pid, &fresh, out_dir));
                 }
             }
