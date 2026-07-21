@@ -91,6 +91,7 @@ mod imp {
     const DEX_HEADER_SIZE: u32 = 0x70;
     const DEX_ENDIAN_CONSTANT: u32 = 0x1234_5678;
     const MAX_DEX_FILE_SIZE: u32 = 0x4000_0000;
+    const DEX_READ_CHUNK: usize = 4096;
     const ELF64_HEADER_SIZE: u32 = 0x40;
     const ELF64_PROGRAM_HEADER_SIZE: u16 = 0x38;
     const ELF_ET_DYN: u16 = 3;
@@ -310,6 +311,13 @@ mod imp {
                 return;
             };
 
+            // A fallback read may have already assembled this DEX; ignore late
+            // chunks so they don't rebuild a pending entry that never
+            // re-completes (and leaves a zero-filled hole).
+            if self.dex_cache.read().unwrap().contains_key(&hdr.begin) {
+                return;
+            }
+
             let maybe_complete = {
                 let mut pending = self.pending_dex.write().unwrap();
                 let state = pending.entry(hdr.begin).or_insert_with(|| {
@@ -398,22 +406,69 @@ mod imp {
             if !shutdown::keep_running() {
                 return;
             }
+            // process_vm_readv needs the process TGID (the BPF side already
+            // emits it); also clear any TBI/PAC top-byte tag on the address.
+            let begin = evt.begin & 0x00ff_ffff_ffff_ffff;
+            if !(DEX_HEADER_SIZE..=MAX_DEX_FILE_SIZE).contains(&evt.size) {
+                eprintln!(
+                    "[dex-fallback] skip dex 0x{begin:x}: unreasonable size {} (pid={})",
+                    evt.size, evt.pid
+                );
+                return;
+            }
+            // The fallback (or a chunk path) may have already assembled it.
+            if self.dex_cache.read().unwrap().contains_key(&begin) {
+                return;
+            }
             // Expected path: bpf_probe_read_user can't fault in pages, so any DEX
             // page that isn't resident yet routes through the userspace fallback.
             // Only surface it under --trace; failures of the fallback itself stay loud.
             if self.trace {
                 eprintln!(
-                    "[~] dex 0x{:x} offset {} not resident at probe time (pid={}); fetching via process_vm_readv",
-                    evt.begin, evt.failed_offset, evt.pid
+                    "[~] dex 0x{begin:x} offset {} not resident at probe time (pid={}); fetching via process_vm_readv",
+                    evt.failed_offset, evt.pid
                 );
             }
-            match read_remote_mem(evt.pid, evt.begin, evt.size) {
-                Ok(bytes) => {
-                    self.pending_dex.write().unwrap().remove(&evt.begin);
-                    self.save_dex(Some(evt.pid), evt.begin, evt.size, bytes);
-                }
-                Err(err) => eprintln!("process_vm_readv failed for dex 0x{:x}: {err:#}", evt.begin),
+            let (mut buf, got) = read_remote_range(evt.pid, begin, evt.size);
+            if got == 0 {
+                eprintln!(
+                    "process_vm_readv failed for dex 0x{begin:x} (pid={}, size={})",
+                    evt.pid, evt.size
+                );
+                return;
             }
+            if (got as u32) < evt.size {
+                eprintln!(
+                    "[dex-fallback] partial dex 0x{begin:x}: {got}/{} bytes (pid={})",
+                    evt.size, evt.pid
+                );
+                buf.truncate(got);
+            }
+            // Prefer the DEX header's file_size once a valid magic is present, so
+            // the dumped length matches what tools expect even when the event
+            // size was off.
+            let mut out_size = buf.len() as u32;
+            if buf.len() >= DEX_HEADER_SIZE_OFFSET && buf.starts_with(b"dex\n") {
+                if let Some(hdr_size) = le32(&buf, DEX_HEADER_FILE_SIZE_OFFSET) {
+                    if (DEX_HEADER_SIZE..=MAX_DEX_FILE_SIZE).contains(&hdr_size) {
+                        if hdr_size <= buf.len() as u32 {
+                            buf.truncate(hdr_size as usize);
+                            out_size = hdr_size;
+                        } else {
+                            // Header claims more than we read; try to extend.
+                            let need = hdr_size as usize - buf.len();
+                            let (extra, extra_got) =
+                                read_remote_range(evt.pid, begin + buf.len() as u64, need as u32);
+                            if extra_got >= need {
+                                buf.extend_from_slice(&extra[..need]);
+                                out_size = hdr_size;
+                            }
+                        }
+                    }
+                }
+            }
+            self.pending_dex.write().unwrap().remove(&begin);
+            self.save_dex(Some(evt.pid), begin, out_size, buf);
         }
 
         fn handle_layout_debug_event(&self, data: &[u8]) {
@@ -1208,6 +1263,35 @@ mod imp {
             }
         }
         None
+    }
+
+    /// Reads `len` bytes at `base` from `pid`. Tries one contiguous
+    /// `process_vm_readv`; on a short read it falls back to page-sized reads so
+    /// a single unreadable hole doesn't abandon the whole DEX. Returns the
+    /// buffer (zero-filled where unread) and how many bytes were populated.
+    fn read_remote_range(pid: u32, base: u64, len: u32) -> (Vec<u8>, usize) {
+        if len == 0 {
+            return (Vec::new(), 0);
+        }
+        if let Ok(buf) = read_remote_mem(pid, base, len) {
+            if buf.len() == len as usize {
+                return (buf, len as usize);
+            }
+        }
+        let mut buf = vec![0u8; len as usize];
+        let mut total = 0;
+        let mut off = 0usize;
+        while off < buf.len() {
+            let chunk = DEX_READ_CHUNK.min(buf.len() - off);
+            if let Ok(page) = read_remote_mem(pid, base + off as u64, chunk as u32) {
+                if page.len() == chunk {
+                    buf[off..off + chunk].copy_from_slice(&page);
+                    total += chunk;
+                }
+            }
+            off += DEX_READ_CHUNK;
+        }
+        (buf, total)
     }
 
     /// Lists the native modules mapped into `pid`, merging each library's
