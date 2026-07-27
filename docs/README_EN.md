@@ -2,168 +2,82 @@
 
 [![Release](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/release.yml/badge.svg)](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/chinleez/eBPFDexDumper-rs)](https://github.com/chinleez/eBPFDexDumper-rs/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/chinleez/eBPFDexDumper-rs/total)](https://github.com/chinleez/eBPFDexDumper-rs/releases)
 
 [中文](../README.md) | English
 
-An eBPF DEX dumper for rooted Android 13-17 ARM64 devices. It captures DEX data from ART with eBPF/uProbe, records executed method bytecode, and can write the recorded bytecode back into dumped DEX files.
+An authorized Android reverse-engineering tool for rooted ARM64 devices. It captures real DEX files from ART, records executed method bytecode, and can restore that bytecode into dumped files. It also dumps runtime native ELF/`.so` images and recovers dynamically registered JNI names.
 
-## Features
+## Quick start
 
-- `dump`: captures DEX through ART entries, DexFile registration/construction, CodeItem backscan, maps scan, and native buffer scan. When `RegisterNatives` can be located, it also captures dynamically-registered JNI method names into `jni_symbols_*.txt`.
-- `fix`: writes recorded method bytecode back into DEX files, keeps repaired copies under `fix/`, and gathers usable outputs under `final/`.
-- `dumpso`: dumps native `.so` libraries from a running process's memory (reads `/proc/<pid>/maps`, merges each library's segments, and reads them out with `process_vm_readv` — no eBPF involved). Supports anonymous-ELF scanning, `--watch` for runtime-unpacked libraries, and system-library filtering; auto-runs `fixso` after dumping by default.
-- `fixso`: repairs dumped `.so` files so IDA/Ghidra can load them — normalizes segment offsets and rebuilds a full section header table from `PT_DYNAMIC` (`.dynsym`, relocations, hash, version, ...). `--symbols` injects recovered symbols (e.g. JNI names) into a real `.symtab`.
-- `offsets`: resolves hook targets from `libart.so`; manual ART layout is supported when needed.
-
-## Requirements
-
-- Build: Rust stable, LLVM clang, Android NDK.
-- Runtime: Android ARM64, root, eBPF-capable kernel, accessible ART `libart.so`.
-- On macOS, LLVM clang is recommended:
-
-```bash
-brew install llvm
-export CLANG=/opt/homebrew/opt/llvm/bin/clang
-```
-
-## Build
+Build and push `target/aarch64-linux-android/release/eBPFDexDumper` to a rooted device:
 
 ```bash
 cargo build
 sh build_android.sh
+su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
+./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
 ```
 
-Android output:
+The default `dump` mode is `full` and runs `fix` on exit. Use `--no-auto-fix` to disable that behavior. Narrower probe modes are useful when a target checks for uprobes:
+
+```bash
+su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
+su -c './eBPFDexDumper dump -n com.example.app --probe-mode maps-only'
+```
+
+## Capabilities
+
+- **`dump`** combines ART lifecycle probes, cross-VMA maps scanning, CodeItem backscan, and native-buffer scanning. It can emit per-method bytecode records and JNI symbol files when `RegisterNatives` is found.
+- **`fix`** restores recorded method bodies. Strict mode skips records whose length disagrees with the DEX header; `--force-mismatch` restores legacy truncate/zero-pad behavior.
+- **`dumpso`** reads `/proc/<pid>/maps` and process memory with `process_vm_readv`; it does not require eBPF. `--watch` follows newly loaded or changing runtime-decrypted libraries.
+- **`fixso`** repairs dumped ELF layout and rebuilds section metadata for IDA/Ghidra. `--symbols` injects recovered JNI names into `.symtab`.
+- **`offsets`** inspects ART hook targets and helps prepare manual layout overrides.
+
+## Output
 
 ```text
-target/aarch64-linux-android/release/eBPFDexDumper
+<output>/<package-or-pid>/
+├── dex_*.dex                 # raw dumps
+├── dex_*_code.json           # bytecode records
+├── fix/                      # repaired DEX files
+├── final/                    # preferred files for analysis
+├── jni_symbols_*.txt         # recovered JNI names, if available
+└── native_elf/               # optional anonymous ELF captures
 ```
 
-## Usage
+`final/` prefers repaired files and falls back to raw dumps. `fix` also prints coverage and writes `*_missed.json` when methods were not captured.
+
+## Native workflow
+
+```bash
+su -c './eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out --watch'
+./eBPFDexDumper fixso -d /data/local/tmp/so_out \
+  -s /data/local/tmp/dex_out/com.example.app/jni_symbols_libfoo.txt
+```
+
+`dumpso` skips system libraries by default; use `--include-system`, `--lib <substring>`, or `--no-anon` to adjust scanning. CompactDex (`cdex`) requires an external cdex-to-dex conversion tool before standard DEX tooling can read it.
+
+## Requirements and limitations
+
+- Android ARM64, root, an eBPF-capable kernel, and readable `/apex/com.android.art/lib64/libart.so`.
+- `--clean-oat` is enabled by default and removes the target app's `oat/` directory before dumping. This is destructive; use `--no-clean-oat` to preserve it.
+- Cross-VMA DEX scanning and system-DEX filtering are built in. Vendor ART layouts, BTF differences, anti-eBPF checks, or fragmented native decryption may still require target-specific adaptation.
+- `full` attaches ART/libc uprobes, `lifecycle` keeps lifecycle probes plus maps scanning, and `maps-only` attaches no uprobes.
+
+## Common commands and development
 
 ```bash
 ./eBPFDexDumper --help
-
-su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
-su -c './eBPFDexDumper dump -u 10123 -o /data/local/tmp/dex_out'
-su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
-su -c './eBPFDexDumper dump -n com.example.app --native-elf-scan'
-
-./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
-./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app --force-mismatch
-
-su -c './eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out'
-su -c './eBPFDexDumper dumpso -n com.example.app --watch --watch-timeout 120'
-./eBPFDexDumper fixso -d /data/local/tmp/so_out
-./eBPFDexDumper fixso -d /data/local/tmp/so_out -s /data/local/tmp/dex_out/com.example.app/jni_symbols_libfoo.txt
-
-./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so
 ./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
-```
-
-Useful `dump` options:
-
-- `--pid <PID>`: restrict tracing to one process in addition to UID/package filtering.
-- `--no-clean-oat`: do not clean OAT files.
-- `--no-auto-fix`: do not auto-fix after dumping.
-- `--debug-layout`: print ART layout diagnostics.
-- `--no-code-item-fallback` / `--no-maps-scan` / `--no-native-buffer-scan`: disable fallback paths.
-- `--native-elf-scan`: experimental scan for anonymous executable ARM64 ELF candidates from native loader behavior.
-- `--probe-mode full|lifecycle|maps-only`: reduce the attached probe set when a target performs uprobe checks.
-- `--libc <PATH>`: set the bionic libc path.
-- `--art-layout <LIST>`: provide ART field offsets manually.
-
-Useful `fix` options:
-
-- `--force-mismatch`: fall back to the legacy "truncate / zero-pad" behaviour when a record's hex-decoded length does not match the DEX header's `insns_size * 2`. Off by default — mismatched records are skipped because padding can corrupt the bytecode stream.
-
-`--art-layout` order:
-
-```text
-ShadowFrame.method,ArtMethod.declaring_class,ArtMethod.dex_method_index,ArtMethod.data,Class.dex_cache,DexCache.dex_file,DexFile.begin,DexHeader.file_size,CodeItem.insns_size,CodeItem.insns
-```
-
-## Package
-
-```bash
 ./scripts/package-release.sh
+cargo fmt --check
+cargo test --locked
 ```
 
-Outputs under `dist/`:
-
-- `eBPFDexDumper_android_arm64`
-- `eBPFDexDumper_android_arm64.sha256`
-- `eBPFDexDumper_android_arm64.tar.gz`
-
-## Notes
-
-### Output layout and auto-fix
-
-`dump` writes everything for one target into a per-target subdirectory under `-o`: `--name` uses the package name (e.g. `com.example.app/`), `--pid`-only falls back to `/proc/<pid>/cmdline` and then `pid_<num>/`, `--uid`-only uses `uid_<num>/`. The subdirectory holds `dex_*.dex` (raw dumps), `dex_*_code.json` (per-method bytecode records), `fix/`, `final/`, plus `native_elf/` when `--native-elf-scan` is enabled.
-
-`dump` runs `fix` on exit by default (use `--no-auto-fix` to disable). The original `dex_*.dex` files always remain. `fix/` stores the repaired DEX for each base; `final/` is the usable result set, preferring the repaired copy and falling back to the original dump when no matching `_code.json` exists or repair fails.
-
-### `fix` behaviour
-
-Strict by default: a record whose hex-decoded length does not match the DEX header's `insns_size * 2` is skipped instead of being truncated / zero-padded into the bytecode stream. Pass `--force-mismatch` to restore the legacy lossy behaviour.
-
-`fix` also produces a method-bytecode coverage report. The console prints one `Coverage: A/B methods (P%), N missed` line per DEX, where the denominator counts every method with `code_off != 0` (abstract / native methods are excluded). When at least one method is missed, the full list is written to `final/<base>_missed.json` with `method_idx`, `code_off`, and a best-effort pretty signature for each missed method, so you can decide whether to extend the trace window and re-run.
-
-### `--clean-oat` (destructive default)
-
-`--clean-oat` is **on by default** and removes the target app's `/data/app/.../oat/` directories before dumping to force ART back into the interpreter. **This is destructive** — pass `--no-clean-oat` to keep them.
-
-### Targeting: ART layout and probe modes
-
-The default ART layout targets common Android 13+ layouts. After validating the DEX header, the BPF side automatically tries the known 64-bit `DexFile::begin_` offsets, including `0x18` on Android 15. Use `--art-layout` when other fields differ on a vendor ROM. Maps scanning and system-DEX filtering support DEX files spanning adjacent VMAs, so a system-library mapping containing only the trailing magic bytes cannot hide an anonymous DEX body. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
-
-When waiting for a cold start by package name or UID, maps scanning retries during a short startup window. This catches DEX mappings that appear after probes are attached but never trigger a lifecycle hook.
-
-#### Android 13–17 validation matrix
-
-The same Android ARM64 release binary was cold-start tested on Google APIs ARM64 emulators for API 33, 34, 35, 36, and 37. The fixture contained 14 protected application DEX files spanning VMAs, with the magic at the end of a fake system-library mapping and the body in the following anonymous mapping:
-
-- Android 13 / API 33: `maps-only` captured 14/14. Lifecycle probes alone observed 13/14 during startup; default lifecycle mode completed 14/14 through its delayed maps rescan.
-- Android 14 / API 34: lifecycle-only and `maps-only` both captured 14/14.
-- Android 15 / API 35: lifecycle-only and `maps-only` both captured 14/14; `DexFile::begin_ = 0x18` was selected automatically.
-- Android 16 / API 36: lifecycle-only and `maps-only` both captured 14/14.
-- Android 17 / API 37 preview: lifecycle-only and `maps-only` both captured 14/14.
-
-DEX headers and parser invariants are checked before files are saved. Framework/APEX DEX files are skipped only when their complete address range belongs to system mappings. These results cover the AOSP/Google APIs paths; vendor kernels, ART forks, and anti-eBPF implementations can still require layout or BTF adaptation.
-
-`full` is the default mode and attaches ART plus libc uprobes. `lifecycle` keeps only DexFile lifecycle probes and maps scan. `maps-only` attaches no uprobes and only scans `/proc/<pid>/maps`. Uprobes can still leave detectable breakpoint-style traces in the target mapping, so use the narrower modes for targets with strong anti-uprobe checks.
-
-### Experimental options
-
-`--native-elf-scan` reuses libc `mmap`/`mprotect` events to identify anonymous executable ARM64 ELF candidates and saves them under `native_elf/` in the target output directory. It is an auxiliary diagnostic path for hidden native loaders and does not change the default DEX dump or fix flow.
-
-### Native `.so` dump and repair (`dumpso` / `fixso`)
-
-`dumpso` reads `/proc/<pid>/maps`, merges each library's separately mapped segments (`r--`/`r-x`/`rw-`) back into one contiguous span by virtual address, and reads it out with `process_vm_readv` — this path does **not** use eBPF/uprobes. It also scans anonymous, path-less regions whose first page starts with the ELF magic, to catch libraries a packer mapped/decrypted itself. Files are named `so_<pid>_<base>_<size>_<name>.so`.
-
-- `--watch`: keep polling maps and dump each new/changed module as it appears (re-dumps up to a cap when sampled contents change), to capture runtime-decrypted libraries (`--watch-interval` default 1s, `--watch-timeout` default 60s, 0 = until Ctrl-C).
-- System libraries under `/system`, `/apex`, `/vendor`, `/system_ext`, `/product`, `/odm` are skipped by default; `--include-system` restores them. `--lib <substr>` dumps only libraries whose path contains the substring.
-- `--no-anon` disables anonymous scanning; `dumpso` auto-runs `fixso` after dumping (`--no-auto-fix` to disable).
-
-`fixso` prefers rebuilding a full section header table from `PT_DYNAMIC` (`.dynsym`/`.dynstr`/`.hash`/`.gnu.hash`/relocations/version/`.init_array`, ..., SoFixer-style, ELF32/64 and Android packed relocations), and falls back to a minimal fix (normalize `p_offset`, raise `p_filesz`, zero the section header table) when there is no `PT_DYNAMIC`. Results are written to `dir/fix/<stem>_fix.so`.
-
-### JNI name recovery (`RegisterNatives`)
-
-Dynamically-registered native methods carry no export symbol, so IDA shows only `sub_XXXX`. During `dump`, when `art::JNI<>::RegisterNatives` can be located in `libart` (by symbol, or — on stripped builds — by cross-referencing the AOSP warning string embedded in the function body), it is hooked and its `JNINativeMethod` array is walked, writing `{fn_ptr, name, sig}` to `jni_symbols_<module>.txt` (and `jni_symbols_raw.txt`) in the output directory.
-
-Feed that file to `fixso --symbols` (`-s`): the recovered names are injected as real `.symtab` symbols into the matching `.so`, so IDA/Ghidra show function names. Use `--register-natives-offset` to set the offset manually. Full loop: `dump` (JNI names) → `dumpso` (the `.so`) → `fixso -s` (inject).
-
-### CompactDex (cdex)
-
-ART's CompactDex (`cdex` magic) is reported with a clear diagnostic instead of being treated as a corrupt DEX. This tool emits standard DEX only; a cdex→dex conversion (e.g. vdexExtractor) is needed first before standard tooling can read it.
+See `--help` for all options, including `--art-layout`, `--register-natives-offset`, `--native-elf-scan`, and scan controls.
 
 ## License
 
-`GPL-3.0-or-later`. The Linux BPF helper headers carry a BSD-2-Clause license at `headers/LICENSE.BSD-2-Clause`.
+`GPL-3.0-or-later`. BPF helper headers are licensed under `headers/LICENSE.BSD-2-Clause`. Use this project only on devices, apps, and data you are authorized to analyze.
 
-Use this project only on devices, apps, and data you are authorized to analyze.
-
-## Reference
-
-This project references part of the implementation logic from [LLeavesG/eBPFDexDumper](https://github.com/LLeavesG/eBPFDexDumper).
+Reference implementation: [LLeavesG/eBPFDexDumper](https://github.com/LLeavesG/eBPFDexDumper).
