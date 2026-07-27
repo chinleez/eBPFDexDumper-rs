@@ -21,7 +21,7 @@ su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
 ```
 
-The default `dump` mode is `full` and runs `fix` on exit. Use `--no-auto-fix` to disable that behavior. Use `lifecycle` or `maps-only` only when the target exits early, checks for uprobes, or a narrower scan is required:
+The default `dump` mode is `full` and automatically runs `fix` on exit, producing `final/`. Pass `--no-auto-fix` only when raw-only output is requested. Use `lifecycle` or `maps-only` only when the target exits early, checks for uprobes, or a narrower scan is required:
 
 ```bash
 su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'

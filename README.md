@@ -27,7 +27,7 @@ sh build_android.sh                 # Android ARM64 release
 su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 ```
 
-默认模式是 `full`，退出时自动执行修复。常用变体：
+默认模式是 `full`，退出时自动执行 `fix` 并整理 `final/`；只有加 `--no-auto-fix` 才会保留为未修复输出。常用变体：
 
 ```bash
 su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'

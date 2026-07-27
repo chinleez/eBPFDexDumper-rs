@@ -12,7 +12,7 @@ Use only for APKs and devices the user is authorized to test. Operate on a local
 1. Identify the APK with `apkanalyzer manifest application-id` and check `adb devices -l` for a usable ARM64 target. If none is listed, inspect local AVDs; do not silently use a remote device.
 2. Ensure `target/aarch64-linux-android/release/eBPFDexDumper` exists; build with `sh build_android.sh` if needed.
 3. Install with `adb install -r <apk>`, resolve the launcher with `adb shell cmd package resolve-activity --brief <package>`, and explicitly start it with `adb shell am start -n <component>`.
-4. Push the binary and run it as root. The default is `--probe-mode full`; use `--no-clean-oat` for non-destructive testing. Fall back to `lifecycle` or `maps-only` only when the target exits early, detects uprobes, or a narrower scan is explicitly needed. Use a unique `/data/local/tmp/<slug>_dump` directory.
+4. Push the binary and run it as root. The default is `--probe-mode full` with automatic `fix` on exit; do not pass `--no-auto-fix` unless the user requests raw-only output. Use `--no-clean-oat` for non-destructive testing. Fall back to `lifecycle` or `maps-only` only when the target exits early, detects uprobes, or a narrower scan is explicitly needed. Use a unique `/data/local/tmp/<slug>_dump` directory.
 5. Let the process load code, then pull `final/` (or raw DEX if auto-fix was interrupted) into `/Users/mac/Downloads/<slug>_live_dump/`.
 6. Validate each pulled file: `dex\n` magic, header `file_size`, SHA-1, Adler32, and `apkanalyzer dex packages`. Tiny files (a few hundred bytes) or checksum failures are fragments, not usable DEX.
 7. Compare SHA-256 hashes against every `classes*.dex` entry in the APK. Report byte-identical files separately from runtime-only files.
