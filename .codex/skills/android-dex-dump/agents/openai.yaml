@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Dex Dump"
+  short_description: "Capture and validate runtime DEX from an authorized local APK"
+  default_prompt: "Dump an authorized local APK with the project tool, pull the runtime DEX, validate its structure, and compare it with the APK's embedded DEX files."
