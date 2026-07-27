@@ -7,6 +7,14 @@ description: Dump and validate runtime DEX files from an authorized local APK on
 
 Use only for APKs and devices the user is authorized to test. Operate on a local APK and local ADB target; do not download or target third-party apps without explicit authorization.
 
+For the complete automated path, run from the repository root:
+
+```bash
+./skills/android-dex-dump/scripts/run_dump.sh /path/to/app.apk
+```
+
+The script uses `full` with automatic repair first, retries `lifecycle` and `maps-only` when no DEX is found, pulls every attempt, and writes `report.txt`. It never treats tiny fragments as valid DEX. JADX and native `dumpso/fixso` remain opt-in follow-up steps.
+
 ## Workflow
 
 1. Identify the APK with `apkanalyzer manifest application-id` and check `adb devices -l` for a usable ARM64 target. If none is listed, inspect local AVDs; do not silently use a remote device.
