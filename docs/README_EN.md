@@ -79,6 +79,12 @@ cargo test --locked
 
 See `--help` for all options, including `--art-layout`, `--register-natives-offset`, `--native-elf-scan`, and scan controls.
 
+## Project skill
+
+The repository includes an explicit [Android DEX dump skill](../skills/android-dex-dump/SKILL.md). It standardizes local APK testing: resolve the package, connect an ARM64 emulator, install and launch the app, run this dumper, pull the DEX files, validate their structure, and compare them with embedded `classes*.dex` entries. JADX decompilation is performed only on checksum-repaired copies, leaving original dumps unchanged.
+
+Use the skill only with APKs and devices you are authorized to test. Record the output path, API/ABI, probe mode, valid DEX count, and crash or fragment evidence.
+
 ## License
 
 `GPL-3.0-or-later`. BPF helper headers are licensed under `headers/LICENSE.BSD-2-Clause`. Use this project only on devices, apps, and data you are authorized to analyze.

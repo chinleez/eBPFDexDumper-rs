@@ -102,6 +102,12 @@ cargo test --locked
 sh build_android.sh
 ```
 
+## 项目 Skill
+
+仓库提供了显式的 [Android DEX dump Skill](skills/android-dex-dump/SKILL.md)，用于把本地 APK 的运行时验证流程标准化：识别包名、连接 ARM64 模拟器、安装并启动应用、调用本项目 dump、拉回 DEX、校验结构，并与 APK 内置 `classes*.dex` 做哈希比对。需要反编译时，Skill 会在副本上修复校验值后调用 JADX，不修改原始 dump。
+
+该 Skill 只适用于已获授权的 APK 和设备；输出目录、API/ABI、探针模式、有效 DEX 数量以及崩溃/残片证据都应记录在测试结果中。
+
 ## 安全边界与许可证
 
 仅在你有权分析的应用、设备和数据上使用。项目采用 `GPL-3.0-or-later`；仓库内 BPF helper 头文件遵循 `headers/LICENSE.BSD-2-Clause`。部分实现参考 [LLeavesG/eBPFDexDumper](https://github.com/LLeavesG/eBPFDexDumper)。
