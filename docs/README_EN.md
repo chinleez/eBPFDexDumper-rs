@@ -4,6 +4,8 @@
 [![Latest Release](https://img.shields.io/github/v/release/chinleez/eBPFDexDumper-rs)](https://github.com/chinleez/eBPFDexDumper-rs/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/chinleez/eBPFDexDumper-rs/total)](https://github.com/chinleez/eBPFDexDumper-rs/releases)
 
+Current release: `v0.2.3`
+
 [中文](../README.md) | English
 
 An authorized Android reverse-engineering tool for rooted ARM64 devices. It captures real DEX files from ART, records executed method bytecode, and can restore that bytecode into dumped files. It also dumps runtime native ELF/`.so` images and recovers dynamically registered JNI names.

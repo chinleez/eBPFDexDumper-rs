@@ -4,6 +4,8 @@
 [![Latest Release](https://img.shields.io/github/v/release/chinleez/eBPFDexDumper-rs)](https://github.com/chinleez/eBPFDexDumper-rs/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/chinleez/eBPFDexDumper-rs/total)](https://github.com/chinleez/eBPFDexDumper-rs/releases)
 
+当前版本：`v0.2.3`
+
 [English](docs/README_EN.md) | 中文
 
 在已 root 的 Android ARM64 设备上，从 ART 运行时捕获真实 DEX，并把执行过的方法字节码回填到 dump 文件。工具也支持运行时 native ELF/`.so` dump 和 JNI 动态注册名恢复，适合授权的 Android 逆向与安全研究。
