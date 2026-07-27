@@ -116,7 +116,21 @@ Strict by default: a record whose hex-decoded length does not match the DEX head
 
 ### Targeting: ART layout and probe modes
 
-The default ART layout targets common Android 13+ layouts. Use `--art-layout` when a ROM uses different offsets. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
+The default ART layout targets common Android 13+ layouts. After validating the DEX header, the BPF side automatically tries the known 64-bit `DexFile::begin_` offsets, including `0x18` on Android 15. Use `--art-layout` when other fields differ on a vendor ROM. Maps scanning and system-DEX filtering support DEX files spanning adjacent VMAs, so a system-library mapping containing only the trailing magic bytes cannot hide an anonymous DEX body. If a target only decrypts fragmented method bodies briefly in native code and never keeps a continuous valid DEX in memory, packer-specific hooks are still required.
+
+When waiting for a cold start by package name or UID, maps scanning retries during a short startup window. This catches DEX mappings that appear after probes are attached but never trigger a lifecycle hook.
+
+#### Android 13–17 validation matrix
+
+The same Android ARM64 release binary was cold-start tested on Google APIs ARM64 emulators for API 33, 34, 35, 36, and 37. The fixture contained 14 protected application DEX files spanning VMAs, with the magic at the end of a fake system-library mapping and the body in the following anonymous mapping:
+
+- Android 13 / API 33: `maps-only` captured 14/14. Lifecycle probes alone observed 13/14 during startup; default lifecycle mode completed 14/14 through its delayed maps rescan.
+- Android 14 / API 34: lifecycle-only and `maps-only` both captured 14/14.
+- Android 15 / API 35: lifecycle-only and `maps-only` both captured 14/14; `DexFile::begin_ = 0x18` was selected automatically.
+- Android 16 / API 36: lifecycle-only and `maps-only` both captured 14/14.
+- Android 17 / API 37 preview: lifecycle-only and `maps-only` both captured 14/14.
+
+DEX headers and parser invariants are checked before files are saved. Framework/APEX DEX files are skipped only when their complete address range belongs to system mappings. These results cover the AOSP/Google APIs paths; vendor kernels, ART forks, and anti-eBPF implementations can still require layout or BTF adaptation.
 
 `full` is the default mode and attaches ART plus libc uprobes. `lifecycle` keeps only DexFile lifecycle probes and maps scan. `maps-only` attaches no uprobes and only scans `/proc/<pid>/maps`. Uprobes can still leave detectable breakpoint-style traces in the target mapping, so use the narrower modes for targets with strong anti-uprobe checks.
 

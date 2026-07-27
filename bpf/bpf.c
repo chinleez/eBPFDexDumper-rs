@@ -24,6 +24,8 @@ const struct jni_method_event_t *unused_jni_method_event_t __attribute__((unused
 #define DEFAULT_CODE_ITEM_INSNS_SIZE_OFFSET 0x0c
 #define DEFAULT_CODE_ITEM_INSNS_OFFSET 0x10
 #define DEX_MAGIC 0x0a786564
+#define DEX_HEADER_SIZE 0x70
+#define DEX_ENDIAN_CONSTANT 0x12345678
 #define MAX_DEX_FILE_SIZE 0x40000000
 #define LAYOUT_REASON_ART_CHAIN_FAILED 1
 #define LAYOUT_REASON_CODE_ITEM_FAILED 2
@@ -138,6 +140,19 @@ static __always_inline int looks_like_dex_header(u64 addr, u32 dex_header_file_s
     if (magic != DEX_MAGIC) {
         return 0;
     }
+    u32 header_size = 0;
+    u32 endian_tag = 0;
+    if (bpf_probe_read_user(
+            &header_size,
+            sizeof(header_size),
+            (void *)((unsigned long)untag((void *)addr) + 0x24)) != 0 ||
+        bpf_probe_read_user(
+            &endian_tag,
+            sizeof(endian_tag),
+            (void *)((unsigned long)untag((void *)addr) + 0x28)) != 0 ||
+        header_size != DEX_HEADER_SIZE || endian_tag != DEX_ENDIAN_CONSTANT) {
+        return 0;
+    }
     if (bpf_probe_read_user(
             size,
             sizeof(u32),
@@ -146,6 +161,35 @@ static __always_inline int looks_like_dex_header(u64 addr, u32 dex_header_file_s
         return 0;
     }
     return *size >= NATIVE_MIN_COPY_SIZE && *size <= MAX_DEX_FILE_SIZE;
+}
+
+// DexFile::begin_ moved between ART releases (for example from +0x08 to
+// +0x18 on Android 15). Try the configured layout first, then the small set
+// of layouts used by current 64-bit ART builds. Header validation prevents a
+// plausible-looking pointer in another field from being accepted.
+static __always_inline int read_valid_dex_begin(
+    unsigned char *dex_file_ptr,
+    u32 configured_offset,
+    u32 dex_header_file_size_offset,
+    u64 *begin,
+    u32 *size)
+{
+    u32 offsets[5] = { configured_offset, 0x08, 0x10, 0x18, 0x20 };
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+        u64 candidate = 0;
+        bpf_probe_read_user(&candidate, sizeof(candidate), dex_file_ptr + offsets[i]);
+        candidate = (u64)untag((void *)candidate);
+        u32 candidate_size = 0;
+        if (looks_like_dex_header(candidate, dex_header_file_size_offset, &candidate_size)) {
+            *begin = candidate;
+            *size = candidate_size;
+            return 1;
+        }
+    }
+    *begin = 0;
+    *size = 0;
+    return 0;
 }
 
 static __always_inline void submit_native_buffer_event(
@@ -259,18 +303,12 @@ static __always_inline int read_dex_from_art_method(
         return 0;
     }
 
-    bpf_probe_read_user(begin, sizeof(u64), dex_file_ptr + dex_file_begin_offset);
-    bpf_probe_read_user(
-        size,
-        sizeof(u32),
-        (void *)((unsigned long)untag((void *)*begin) + dex_header_file_size_offset));
-    if (*begin == 0 || *size == 0 || *size > MAX_DEX_FILE_SIZE) {
-        return 0;
-    }
-
-    u32 magic = 0;
-    bpf_probe_read_user(&magic, sizeof(u32), (void *)untag((void *)*begin));
-    if (magic != DEX_MAGIC) {
+    if (!read_valid_dex_begin(
+            dex_file_ptr,
+            dex_file_begin_offset,
+            dex_header_file_size_offset,
+            begin,
+            size)) {
         return 0;
     }
     // Strip MTE/PAC tag from the output begin so subsequent BPF chunk reads
@@ -842,13 +880,13 @@ int uprobe_libart_registerDexFile(struct pt_regs *ctx)
 
     struct art_layout_t *layout = get_art_layout();
     u64 begin = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + layout->dex_file_begin_offset);
-    if (begin == 0) {
-        return 0;
-    }
-    begin = (u64)untag((void *)begin);
     u32 size = 0;
-    if (looks_like_dex_header(begin, layout->dex_header_file_size_offset, &size)) {
+    if (read_valid_dex_begin(
+            dex_file_ptr,
+            layout->dex_file_begin_offset,
+            layout->dex_header_file_size_offset,
+            &begin,
+            &size)) {
         submit_dex_from_begin(pid, begin, size);
     }
     return 0;
@@ -872,17 +910,12 @@ int uprobe_libart_verifyClass(struct pt_regs *ctx)
     
     u64 begin = 0;
     u32 size = 0;
-    bpf_probe_read_user(&begin, sizeof(u64), dex_file_ptr + layout->dex_file_begin_offset);
-    if (begin == 0) {
-        return 0;
-    }
-    begin = (u64)untag((void *)begin);
-    bpf_probe_read_user(
-        &size,
-        sizeof(u32),
-        (void *)((unsigned long)begin + layout->dex_header_file_size_offset));
-
-    if (size != 0 && size <= MAX_DEX_FILE_SIZE) {
+    if (read_valid_dex_begin(
+            dex_file_ptr,
+            layout->dex_file_begin_offset,
+            layout->dex_header_file_size_offset,
+            &begin,
+            &size)) {
         u32 exist = 1;
         u32 *value = (u32 *)bpf_map_lookup_elem(&dexFileCache_map, &begin);
 

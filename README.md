@@ -66,7 +66,21 @@ su -c './eBPFDexDumper dumpso -n com.example.app --watch --watch-timeout 120'
 
 ### 适配：ART layout 与探针模式
 
-默认 ART layout 按 Android 13+ 常见布局处理；ROM 偏移不一致时使用 `--art-layout`。如果目标只在 native 层短暂解密碎片化方法体，内存中不保留连续合法 DEX，需要按壳适配。
+默认 ART layout 按 Android 13+ 常见布局处理；`DexFile::begin_` 会在校验 DEX header 后自动尝试当前 64 位 ART 的常见偏移（包括 Android 15 的 `0x18`），ROM 其余字段偏移不一致时使用 `--art-layout`。maps 扫描和系统 DEX 过滤支持 DEX 跨越连续 VMA，避免把“系统库映射尾部 magic + 匿名主体”误判成系统 DEX。如果目标只在 native 层短暂解密碎片化方法体，内存中不保留连续合法 DEX，仍需要按壳适配。
+
+按包名或 UID 等待冷启动时，maps 扫描会在短暂启动窗口内补扫，避免只看到外壳或漏掉已映射但未触发生命周期探针的 DEX。Android 13、14、15、16 和 Android 17（API 37 预览版）的 ARM64 Google APIs 模拟器均已验证 `lifecycle` 与 `maps-only` 路径；实际设备仍可能因厂商 ART 或内核 eBPF 配置而需要 `--art-layout`/BTF 适配。
+
+#### Android 13–17 验证矩阵
+
+当前版本使用同一个 Android ARM64 release 二进制，在 API 33、34、35、36、37 的 Google APIs ARM64 模拟器上完成冷启动验证。测试目标包含 14 个跨 VMA 映射的受保护业务 DEX（magic 位于伪系统库映射末尾，主体位于后续匿名映射）：
+
+- Android 13 / API 33：`maps-only` 捕获 14/14；纯 lifecycle 在启动窗口内捕获 13/14，默认 lifecycle 通过延迟 maps 补扫收齐 14/14。
+- Android 14 / API 34：纯 lifecycle 与 `maps-only` 均捕获 14/14。
+- Android 15 / API 35：纯 lifecycle 与 `maps-only` 均捕获 14/14，自动识别 `DexFile::begin_ = 0x18`。
+- Android 16 / API 36：纯 lifecycle 与 `maps-only` 均捕获 14/14。
+- Android 17 / API 37 预览版：纯 lifecycle 与 `maps-only` 均捕获 14/14。
+
+保存前仍会通过 DEX header 和解析器校验；系统 framework/APEX DEX 只有在完整地址范围均属于系统映射时才会跳过。上述结果证明 AOSP/Google APIs 环境中的主路径兼容性，不代表所有厂商内核、ART 分支或反 eBPF 实现无需额外适配。
 
 `--probe-mode full|lifecycle|maps-only` 用于按场景收窄探针面：`full` 为默认全量 ART/libc uprobe；`lifecycle` 只保留 DexFile 生命周期探针和 maps 扫描；`maps-only` 不挂 uprobe，只做 `/proc/<pid>/maps` 内存扫描。uprobe 在目标映射上仍可能留下可检测痕迹，强反调试目标可先尝试 `lifecycle` 或 `maps-only`。
 

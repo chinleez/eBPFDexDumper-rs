@@ -34,9 +34,10 @@ impl ArtRuntimeLayout {
     /// 64-bit Android. Vendor ROMs that disable compressed references (rare
     /// on phones, occasionally seen in emulators / desktop ART builds) need
     /// to override the layout via `--art-layout` and adjust the `class_*` /
-    /// `dex_cache_*` offsets accordingly. The other offsets (DexFile,
-    /// DexHeader, CodeItem) are dictated by the DEX format itself and are
-    /// version-stable.
+    /// `dex_cache_*` offsets accordingly. `DexFile::begin_` is only the
+    /// preferred offset: the BPF side validates it and falls back across the
+    /// known 64-bit ART offsets because this field moved on Android 15.
+    /// DexHeader and CodeItem offsets are dictated by the DEX format itself.
     pub const fn android_13_plus_default() -> Self {
         Self {
             shadow_frame_method_offset: 0x08,

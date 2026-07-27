@@ -155,6 +155,7 @@ mod imp {
         method_records: RwLock<HashMap<u64, Vec<MethodCodeRecord>>>,
         method_sig_cache: RwLock<HashMap<(u64, u32), String>>,
         maps_cache: RwLock<HashMap<u32, MapsRegions>>,
+        layout_events_seen: RwLock<HashSet<(u32, u64, u32, u32)>>,
         jni_methods: RwLock<Vec<JniMethod>>,
     }
 
@@ -196,6 +197,29 @@ mod imp {
             } else {
                 None
             }
+        }
+
+        fn range_is_exclusively_system(&self, start: u64, size: u32) -> bool {
+            let Some(end) = start.checked_add(size as u64) else {
+                return false;
+            };
+            let mut cursor = start;
+            for region in &self.regions {
+                if region.end <= cursor {
+                    continue;
+                }
+                if region.start > cursor || cursor >= end {
+                    break;
+                }
+                if !crate::platform::is_system_dex_path(&region.path) {
+                    return false;
+                }
+                cursor = region.end.min(end);
+                if cursor == end {
+                    return true;
+                }
+            }
+            false
         }
     }
 
@@ -263,29 +287,17 @@ mod imp {
                 method_records: RwLock::new(HashMap::new()),
                 method_sig_cache: RwLock::new(HashMap::new()),
                 maps_cache: RwLock::new(HashMap::new()),
+                layout_events_seen: RwLock::new(HashSet::new()),
                 jni_methods: RwLock::new(Vec::new()),
             }
         }
 
-        fn lookup_path_for(&self, pid: u32, addr: u64) -> Option<String> {
-            {
-                let cache = self.maps_cache.read().unwrap();
-                if let Some(maps) = cache.get(&pid) {
-                    if let Some(path) = maps.lookup(addr) {
-                        return Some(path.to_string());
-                    }
-                }
-            }
+        fn should_skip_system(&self, pid: u32, addr: u64, size: u32) -> Option<String> {
             let mut cache = self.maps_cache.write().unwrap();
             let maps = cache.entry(pid).or_default();
             maps.refresh(pid);
-            maps.lookup(addr).map(|s| s.to_string())
-        }
-
-        fn should_skip_system(&self, pid: u32, addr: u64) -> Option<String> {
-            let path = self.lookup_path_for(pid, addr)?;
-            if crate::platform::is_system_dex_path(&path) {
-                Some(path)
+            if maps.range_is_exclusively_system(addr, size) {
+                maps.lookup(addr).map(str::to_owned)
             } else {
                 None
             }
@@ -479,6 +491,21 @@ mod imp {
             if !shutdown::keep_running() {
                 return;
             }
+            let identity = if evt.begin != 0 {
+                evt.begin
+            } else if evt.code_item_ptr != 0 {
+                evt.code_item_ptr
+            } else {
+                evt.art_method_ptr
+            };
+            if !self
+                .layout_events_seen
+                .write()
+                .unwrap()
+                .insert((evt.pid, identity, evt.reason, evt.source))
+            {
+                return;
+            }
             if self.trace {
                 println!(
                     "layout event pid={} art_method=0x{:x} code_item=0x{:x} begin=0x{:x} size={} reason={} source={}",
@@ -584,7 +611,7 @@ mod imp {
 
         fn save_dex(&self, pid: Option<u32>, begin: u64, size: u32, bytes: Vec<u8>) {
             if let Some(pid) = pid {
-                if let Some(path) = self.should_skip_system(pid, begin) {
+                if let Some(path) = self.should_skip_system(pid, begin, size) {
                     if self.trace {
                         eprintln!("[~] skip system dex 0x{begin:x} pid={pid} path={path}");
                     }
@@ -785,13 +812,18 @@ mod imp {
             Ok(())
         }
 
-        fn scan_uid_maps_once(&self, uid: u32) {
+        fn scan_uid_maps_once(&self, uid: u32) -> usize {
             match scan_uid_maps(uid, self.trace) {
-                Ok(found) => self.save_scanned_dexes(None, found),
+                Ok(found) => {
+                    let count = found.len();
+                    self.save_scanned_dexes(None, found);
+                    count
+                }
                 Err(err) => {
                     if self.trace {
                         eprintln!("maps scan skipped: {err:#}");
                     }
+                    0
                 }
             }
         }
@@ -813,7 +845,21 @@ mod imp {
                         }
                     }
                 },
-                None => state.scan_uid_maps_once(uid),
+                None => {
+                    // When dumping by package/UID the process often starts
+                    // after probes are attached. A single eager scan races
+                    // that cold start and can observe only the shell before
+                    // secondary DEX mappings appear. Rescan through a short
+                    // startup window; content hashes make repeats cheap to
+                    // discard at save time.
+                    for _ in 0..8 {
+                        if !shutdown::keep_running() {
+                            break;
+                        }
+                        state.scan_uid_maps_once(uid);
+                        thread::sleep(Duration::from_secs(2));
+                    }
+                }
             })
         }
     }
@@ -1901,22 +1947,26 @@ mod imp {
     fn scan_process_maps(pid: u32) -> Result<Vec<(u64, u32, Vec<u8>)>> {
         let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
             .with_context(|| format!("read /proc/{pid}/maps"))?;
+        let regions: Vec<_> = maps.lines().filter_map(parse_readable_map_region).collect();
+        let system_ranges = MapsRegions {
+            regions: maps.lines().filter_map(parse_maps_entry).collect(),
+        };
         let mut found = Vec::new();
-        for line in maps.lines() {
+        for (index, region) in regions.iter().enumerate() {
             if !keep_running() {
                 break;
             }
-            let Some(region) = parse_readable_map_region(line) else {
-                continue;
-            };
             if region.end <= region.start || region.end - region.start > MAPS_SCAN_MAX_REGION {
                 continue;
             }
-            if crate::platform::is_system_dex_path(&region.path) {
-                continue;
-            }
-            scan_region_for_dex(pid, region.start, region.end, &mut found);
+            // A protector can put the four-byte magic at the very end of one
+            // mapping and the rest of the DEX in the next mapping. Extend the
+            // readable limit across adjacent VMAs, but scan each VMA's bytes
+            // only once for candidate magic.
+            let readable_end = contiguous_readable_end(&regions, index);
+            scan_region_for_dex(pid, region.start, region.end, readable_end, &mut found);
         }
+        found.retain(|(begin, size, _)| !system_ranges.range_is_exclusively_system(*begin, *size));
         Ok(found)
     }
 
@@ -1924,7 +1974,17 @@ mod imp {
     struct MapRegion {
         start: u64,
         end: u64,
-        path: String,
+    }
+
+    fn contiguous_readable_end(regions: &[MapRegion], index: usize) -> u64 {
+        let mut end = regions[index].end;
+        for next in &regions[index + 1..] {
+            if next.start != end {
+                break;
+            }
+            end = next.end;
+        }
+        end
     }
 
     fn parse_readable_map_region(line: &str) -> Option<MapRegion> {
@@ -1938,12 +1998,10 @@ mod imp {
         let _ = parts.next()?;
         let _ = parts.next()?;
         let _ = parts.next()?;
-        let path = parts.collect::<Vec<_>>().join(" ");
         let (start, end) = range.split_once('-')?;
         Some(MapRegion {
             start: u64::from_str_radix(start, 16).ok()?,
             end: u64::from_str_radix(end, 16).ok()?,
-            path,
         })
     }
 
@@ -1963,26 +2021,35 @@ mod imp {
         })
     }
 
-    fn scan_region_for_dex(pid: u32, start: u64, end: u64, found: &mut Vec<(u64, u32, Vec<u8>)>) {
+    fn scan_region_for_dex(
+        pid: u32,
+        start: u64,
+        scan_end: u64,
+        readable_end: u64,
+        found: &mut Vec<(u64, u32, Vec<u8>)>,
+    ) {
         let mut pos = start;
-        while pos + DEX_HEADER_SIZE as u64 <= end {
+        while pos < scan_end {
             if !keep_running() {
                 return;
             }
-            let Ok(page) = read_remote_mem(pid, pos, CODE_ITEM_BACKSCAN_STEP as u32) else {
+            let chunk = CODE_ITEM_BACKSCAN_STEP.min(scan_end - pos);
+            let Ok(page) = read_remote_mem(pid, pos, chunk as u32) else {
                 pos = pos.saturating_add(CODE_ITEM_BACKSCAN_STEP);
                 continue;
             };
             let mut off = 0usize;
             while let Some(idx) = find_subslice(&page[off..], b"dex\n") {
                 let begin = pos + (off + idx) as u64;
-                if begin + DEX_HEADER_SIZE as u64 > end {
+                if begin + DEX_HEADER_SIZE as u64 > readable_end {
                     break;
                 }
-                if let Ok(header) = read_remote_mem(pid, begin, DEX_HEADER_SIZE) {
+                let (header, header_got) = read_remote_range(pid, begin, DEX_HEADER_SIZE);
+                if header_got == DEX_HEADER_SIZE as usize {
                     if let Some(size) = validate_dex_header(&header) {
-                        if begin + size as u64 <= end {
-                            if let Ok(bytes) = read_remote_mem(pid, begin, size) {
+                        if begin + size as u64 <= readable_end {
+                            let (bytes, got) = read_remote_range(pid, begin, size);
+                            if got == size as usize {
                                 if DexParser::new(&bytes).is_ok() {
                                     found.push((begin, size, bytes));
                                 }
@@ -2074,7 +2141,7 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::DexRecvState;
+        use super::{contiguous_readable_end, DexRecvState, MapRegion, MapsEntry, MapsRegions};
 
         fn empty_state(total: u32) -> DexRecvState {
             DexRecvState {
@@ -2129,6 +2196,46 @@ mod imp {
             s.record(10, 10);
             assert!(s.intervals.is_empty());
             assert!(!s.is_complete());
+        }
+
+        #[test]
+        fn system_range_must_not_cross_into_anonymous_mapping() {
+            let maps = MapsRegions {
+                regions: vec![
+                    MapsEntry {
+                        start: 0x1000,
+                        end: 0x2000,
+                        path: "/apex/com.android.runtime/lib64/bionic/libm.so".into(),
+                    },
+                    MapsEntry {
+                        start: 0x2000,
+                        end: 0x5000,
+                        path: String::new(),
+                    },
+                ],
+            };
+            assert!(maps.range_is_exclusively_system(0x1100, 0x100));
+            assert!(!maps.range_is_exclusively_system(0x1ffc, 0x2000));
+        }
+
+        #[test]
+        fn contiguous_readable_span_crosses_vma_boundaries() {
+            let regions = vec![
+                MapRegion {
+                    start: 0x1000,
+                    end: 0x2000,
+                },
+                MapRegion {
+                    start: 0x2000,
+                    end: 0x5000,
+                },
+                MapRegion {
+                    start: 0x6000,
+                    end: 0x7000,
+                },
+            ];
+            assert_eq!(contiguous_readable_end(&regions, 0), 0x5000);
+            assert_eq!(contiguous_readable_end(&regions, 2), 0x7000);
         }
     }
 }
