@@ -106,6 +106,14 @@ sh build_android.sh
 
 仓库提供了显式的 [Android DEX dump Skill](skills/android-dex-dump/SKILL.md)，用于把本地 APK 的运行时验证流程标准化：识别包名、连接 ARM64 模拟器、安装并启动应用、调用本项目 dump、拉回 DEX、校验结构，并与 APK 内置 `classes*.dex` 做哈希比对。需要反编译时，Skill 会在副本上修复校验值后调用 JADX，不修改原始 dump。
 
+一键执行完整流程：
+
+```bash
+./skills/android-dex-dump/scripts/run_dump.sh /path/to/app.apk
+```
+
+脚本默认执行 `full` 并自动修复；没有捕获到 DEX 时按 `lifecycle` → `maps-only` 自动重试，结果和 `report.txt` 写入 Downloads 下的新目录。
+
 该 Skill 只适用于已获授权的 APK 和设备；输出目录、API/ABI、探针模式、有效 DEX 数量以及崩溃/残片证据都应记录在测试结果中。
 
 ## 安全边界与许可证

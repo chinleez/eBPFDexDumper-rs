@@ -83,6 +83,14 @@ See `--help` for all options, including `--art-layout`, `--register-natives-offs
 
 The repository includes an explicit [Android DEX dump skill](../skills/android-dex-dump/SKILL.md). It standardizes local APK testing: resolve the package, connect an ARM64 emulator, install and launch the app, run this dumper, pull the DEX files, validate their structure, and compare them with embedded `classes*.dex` entries. JADX decompilation is performed only on checksum-repaired copies, leaving original dumps unchanged.
 
+Run the complete workflow with:
+
+```bash
+./skills/android-dex-dump/scripts/run_dump.sh /path/to/app.apk
+```
+
+The script starts with `full` and automatic repair, then retries `lifecycle` and `maps-only` only when no DEX is captured. Results and `report.txt` are written to a new directory under Downloads.
+
 Use the skill only with APKs and devices you are authorized to test. Record the output path, API/ABI, probe mode, valid DEX count, and crash or fragment evidence.
 
 ## License
