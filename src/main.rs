@@ -8,6 +8,7 @@ use std::path::PathBuf;
 #[command(
     name = "eBPFDexDumper",
     about = "Android eBPF DEX dumper",
+    version,
     after_help = "Project GitHub: https://github.com/chinleez/eBPFDexDumper-rs",
     disable_help_subcommand = true
 )]

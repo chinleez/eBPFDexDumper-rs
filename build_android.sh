@@ -37,5 +37,10 @@ else
       fi
     done
   fi
+  if [ -z "${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-}" ]; then
+    echo "error: Android NDK not found; install an NDK and set ANDROID_NDK_HOME" >&2
+    echo "       (or NDK_HOME), or set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER" >&2
+    exit 1
+  fi
   "${cargo_bin}" build --target aarch64-linux-android --release
 fi

@@ -600,9 +600,12 @@ static __always_inline int handle_art_method(struct config_t *conf, u32 pid, u64
         return 0;
     }
 
+    if (begin == 0 || size == 0) {
+        return 0;
+    }
     u8 ch = 0;
     bpf_probe_read_user(&ch, sizeof(u8), (void *)untag((void *)begin));
-    if (begin == 0 || size == 0 || ch != 0x64) {
+    if (ch != 0x64) {
         return 0;
     }
 

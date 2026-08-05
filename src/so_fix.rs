@@ -1465,7 +1465,7 @@ mod tests {
         // --- .dynamic at 0x300 ---
         let dynamic = 0x300usize;
         let mut d = dynamic;
-        let mut put_dyn = |img: &mut [u8], d: &mut usize, tag: i64, val: u64| {
+        let put_dyn = |img: &mut [u8], d: &mut usize, tag: i64, val: u64| {
             wr_u64(img, *d, tag as u64);
             wr_u64(img, *d + 8, val);
             *d += 16;

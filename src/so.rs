@@ -8,6 +8,11 @@
 //! going through the dynamic linker. `--watch` keeps polling so a runtime-
 //! decrypted library is captured the moment it appears (or changes).
 
+// The shared parsing/grouping helpers below are only referenced by the
+// Linux/Android implementation; on other hosts they exist solely for the
+// unit tests, so don't warn about them being unused there.
+#![cfg_attr(not(any(target_os = "android", target_os = "linux")), allow(dead_code))]
+
 use std::path::PathBuf;
 use std::time::Duration;
 
