@@ -4,97 +4,84 @@
 [![Latest Release](https://img.shields.io/github/v/release/chinleez/eBPFDexDumper-rs)](https://github.com/chinleez/eBPFDexDumper-rs/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/chinleez/eBPFDexDumper-rs/total)](https://github.com/chinleez/eBPFDexDumper-rs/releases)
 
-Current release: `v0.2.3`
-
 [中文](../README.md) | English
 
-An authorized Android reverse-engineering tool for rooted ARM64 devices. It captures real DEX files from ART, records executed method bytecode, and can restore that bytecode into dumped files. It also dumps runtime native ELF/`.so` images and recovers dynamically registered JNI names.
+An authorized Android reverse-engineering tool for rooted ARM64 devices. It captures real DEX files from ART, records executed method bytecode, and restores it into dumped files. It also dumps runtime native `.so` images and recovers dynamically registered JNI names.
 
 ## Quick start
 
-Build and push `target/aarch64-linux-android/release/eBPFDexDumper` to a rooted device:
+```bash
+cargo build                # local debug build
+sh build_android.sh        # Android ARM64 release
+```
+
+Push `target/aarch64-linux-android/release/eBPFDexDumper` to a rooted device with eBPF support:
 
 ```bash
-cargo build
-sh build_android.sh
 su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
+```
+
+The default `full` mode automatically fixes DEX files on exit and produces `final/`. To fix manually:
+
+```bash
 ./eBPFDexDumper fix -d /data/local/tmp/dex_out/com.example.app
 ```
 
-The default `dump` mode is `full` and automatically runs `fix` on exit, producing `final/`. Pass `--no-auto-fix` only when raw-only output is requested. Use `lifecycle` or `maps-only` only when the target exits early, checks for uprobes, or a narrower scan is required:
+## Subcommands
 
-```bash
-su -c './eBPFDexDumper dump -n com.example.app --probe-mode lifecycle'
-su -c './eBPFDexDumper dump -n com.example.app --probe-mode maps-only'
-```
-
-## Capabilities
-
-- **`dump`** combines ART lifecycle probes, cross-VMA maps scanning, CodeItem backscan, and native-buffer scanning. It can emit per-method bytecode records and JNI symbol files when `RegisterNatives` is found.
-- **`fix`** restores recorded method bodies. Strict mode skips records whose length disagrees with the DEX header; `--force-mismatch` restores legacy truncate/zero-pad behavior.
-- **`dumpso`** reads `/proc/<pid>/maps` and process memory with `process_vm_readv`; it does not require eBPF. `--watch` follows newly loaded or changing runtime-decrypted libraries.
-- **`fixso`** repairs dumped ELF layout and rebuilds section metadata for IDA/Ghidra. `--symbols` injects recovered JNI names into `.symtab`.
-- **`offsets`** inspects ART hook targets and helps prepare manual layout overrides.
+- **`dump`** captures DEX via ART lifecycle probes, maps scanning, CodeItem backscan, and native-buffer scanning; records executed method bytecode and can recover JNI names.
+- **`fix`** restores recorded method bodies and reports coverage. Length mismatches are skipped by default; `--force-mismatch` writes them anyway.
+- **`dumpso`** dumps native `.so` files from `/proc/<pid>/maps` with `process_vm_readv` (no eBPF); `--watch` follows runtime-decrypted or newly loaded libraries.
+- **`fixso`** repairs segment offsets and rebuilds the section table from `PT_DYNAMIC`; `--symbols` injects JNI names.
+- **`offsets`** inspects `libart.so` hook targets and ART layout for adapting to different ROMs.
 
 ## Output
 
 ```text
 <output>/<package-or-pid>/
-├── dex_*.dex                 # raw dumps
-├── dex_*_code.json           # bytecode records
-├── fix/                      # repaired DEX files
-├── final/                    # preferred files for analysis
-├── jni_symbols_*.txt         # recovered JNI names, if available
-└── native_elf/               # optional anonymous ELF captures
+├── dex_*.dex               # raw DEX
+├── dex_*_code.json         # bytecode records
+├── fix/                    # repaired DEX
+├── final/                  # preferred for analysis
+├── jni_symbols_*.txt       # JNI names (optional)
+└── native_elf/             # anonymous ELF (optional)
 ```
 
-`final/` prefers repaired files and falls back to raw dumps. `fix` also prints coverage and writes `*_missed.json` when methods were not captured.
+## Common options
 
-## Native workflow
+- `--probe-mode full|lifecycle|maps-only`: controls probe coverage; `maps-only` attaches no uprobes.
+- `--clean-oat` (enabled by default): removes the target app's `oat/` before dumping; use `--no-clean-oat` to keep it.
+- `--no-maps-scan` / `--no-native-buffer-scan` / `--native-elf-scan`: toggle scans.
+- `--art-layout` / `--register-natives-offset`: manual overrides for incompatible ROMs.
+- See `./eBPFDexDumper --help` for all options.
 
-```bash
-su -c './eBPFDexDumper dumpso -n com.example.app -o /data/local/tmp/so_out --watch'
-./eBPFDexDumper fixso -d /data/local/tmp/so_out \
-  -s /data/local/tmp/dex_out/com.example.app/jni_symbols_libfoo.txt
-```
+## Limitations
 
-`dumpso` skips system libraries by default; use `--include-system`, `--lib <substring>`, or `--no-anon` to adjust scanning. CompactDex (`cdex`) requires an external cdex-to-dex conversion tool before standard DEX tooling can read it.
+- Designed for common Android 13+ ARM64 ART layouts; vendor ROMs may differ in offsets, BTF, or eBPF behavior. Run `offsets` first when adapting.
+- CompactDex (`cdex`) must be converted to standard DEX with an external tool first.
+- uprobes can be detected by anti-debugging; no guarantees against all protections.
+- `dumpso` skips `/system`, `/apex`, `/vendor`, and similar libraries by default; use `--include-system` or `--lib` when needed.
 
-## Requirements and limitations
-
-- Android ARM64, root, an eBPF-capable kernel, and readable `/apex/com.android.art/lib64/libart.so`.
-- `--clean-oat` is enabled by default and removes the target app's `oat/` directory before dumping. This is destructive; use `--no-clean-oat` to preserve it.
-- Cross-VMA DEX scanning and system-DEX filtering are built in. Vendor ART layouts, BTF differences, anti-eBPF checks, or fragmented native decryption may still require target-specific adaptation.
-- `full` attaches ART/libc uprobes, `lifecycle` keeps lifecycle probes plus maps scanning, and `maps-only` attaches no uprobes.
-
-## Common commands and development
+## Development and testing
 
 ```bash
-./eBPFDexDumper --help
-./eBPFDexDumper offsets -l /apex/com.android.art/lib64/libart.so --json
-./scripts/package-release.sh
 cargo fmt --check
 cargo test --locked
+sh build_android.sh
 ```
-
-See `--help` for all options, including `--art-layout`, `--register-natives-offset`, `--native-elf-scan`, and scan controls.
 
 ## Project skill
 
-The repository includes an explicit [Android DEX dump skill](../skills/android-dex-dump/SKILL.md). It standardizes local APK testing: resolve the package, connect an ARM64 emulator, install and launch the app, run this dumper, pull the DEX files, validate their structure, and compare them with embedded `classes*.dex` entries. JADX decompilation is performed only on checksum-repaired copies, leaving original dumps unchanged.
-
-Run the complete workflow with:
+The repository provides an [Android DEX dump skill](../skills/android-dex-dump/SKILL.md) that automates installing, launching, dumping, and validating a local APK:
 
 ```bash
 ./skills/android-dex-dump/scripts/run_dump.sh /path/to/app.apk
 ```
 
-The script starts with `full` and automatic repair, then retries `lifecycle` and `maps-only` only when no DEX is captured. Results and `report.txt` are written to a new directory under Downloads.
-
-Use the skill only with APKs and devices you are authorized to test. Record the output path, API/ABI, probe mode, valid DEX count, and crash or fragment evidence.
+The script tries `full → lifecycle → maps-only` in order and writes results plus `report.txt` to a new directory under Downloads. Use it only with APKs and devices you are authorized to test.
 
 ## License
 
-`GPL-3.0-or-later`. BPF helper headers are licensed under `headers/LICENSE.BSD-2-Clause`. Use this project only on devices, apps, and data you are authorized to analyze.
+`GPL-3.0-or-later`; BPF helper headers are BSD-2-Clause. Use this project only on devices, apps, and data you are authorized to analyze.
 
 Reference implementation: [LLeavesG/eBPFDexDumper](https://github.com/LLeavesG/eBPFDexDumper).
