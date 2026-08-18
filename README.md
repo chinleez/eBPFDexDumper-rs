@@ -1,3 +1,5 @@
+
+
 # eBPFDexDumper-rs
 
 [![Release](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/release.yml/badge.svg)](https://github.com/chinleez/eBPFDexDumper-rs/actions/workflows/release.yml)
@@ -68,6 +70,7 @@ su -c './eBPFDexDumper dump -n com.example.app -o /data/local/tmp/dex_out'
 cargo fmt --check
 cargo test --locked
 sh build_android.sh
+./scripts/package-release.sh  # 本地生成 Release 产物
 ```
 
 ## 项目 Skill
