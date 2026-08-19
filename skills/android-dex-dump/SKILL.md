@@ -21,10 +21,10 @@ The script uses `full` with automatic repair first, retries `lifecycle` and `map
 2. Ensure `target/aarch64-linux-android/release/eBPFDexDumper` exists; build with `sh build_android.sh` if needed.
 3. Install with `adb install -r <apk>`, resolve the launcher with `adb shell cmd package resolve-activity --brief <package>`, and explicitly start it with `adb shell am start -n <component>`.
 4. Push the binary and run it as root. The default is `--probe-mode full` with automatic `fix` on exit; do not pass `--no-auto-fix` unless the user requests raw-only output. Use `--no-clean-oat` for non-destructive testing. Fall back to `lifecycle` or `maps-only` only when the target exits early, detects uprobes, or a narrower scan is explicitly needed. Use a unique `/data/local/tmp/<slug>_dump` directory.
-5. Let the process load code, then pull `final/` (or raw DEX if auto-fix was interrupted) into `/Users/mac/Downloads/<slug>_live_dump/`.
+5. Let the process load code, then pull `final/` (or raw DEX if auto-fix was interrupted) into `$HOME/Downloads/<slug>_live_dump/` (on this Mac, `$HOME` is `/Users/praise`).
 6. Validate each pulled file: `dex\n` magic, header `file_size`, SHA-1, Adler32, and `apkanalyzer dex packages`. Tiny files (a few hundred bytes) or checksum failures are fragments, not usable DEX.
 7. Compare SHA-256 hashes against every `classes*.dex` entry in the APK. Report byte-identical files separately from runtime-only files.
-8. For JADX, preserve originals and repair checksum only in copies. Write sources to a new `/Users/mac/Downloads/<slug>_jadx_<date>/` directory and report errors.
+8. For JADX, preserve originals and repair checksum only in copies. Write sources to a new `$HOME/Downloads/<slug>_jadx_<date>/` directory and report errors.
 
 ## Failure handling
 

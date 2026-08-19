@@ -7,17 +7,32 @@ if [[ $# -lt 1 ]]; then
 fi
 
 APK=$1
-OUT=${2:-"/Users/mac/Downloads/android-dex-$(date +%Y%m%d-%H%M%S)"}
+OUT=${2:-"${HOME}/Downloads/android-dex-$(date +%Y%m%d-%H%M%S)"}
 BIN=${DUMPER_BIN:-"$(pwd)/target/aarch64-linux-android/release/eBPFDexDumper"}
 ADB=${ADB:-adb}
+AAPT=${AAPT:-}
 
 [[ -f "$APK" ]] || { echo "APK not found: $APK" >&2; exit 1; }
 [[ -x "$BIN" ]] || { echo "Dumper binary not found: $BIN" >&2; exit 1; }
 mkdir -p "$OUT"
 
-PKG=$(apkanalyzer manifest application-id "$APK" 2>/dev/null || true)
+if command -v apkanalyzer >/dev/null 2>&1; then
+  PKG=$(apkanalyzer manifest application-id "$APK" 2>/dev/null || true)
+else
+  if [[ -z "$AAPT" ]]; then
+    SDK_ROOT=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}
+    if [[ -d "$SDK_ROOT/build-tools" ]]; then
+      AAPT=$(find "$SDK_ROOT/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -1) || true
+    fi
+  fi
+  if [[ -n "$AAPT" && -x "$AAPT" ]]; then
+    PKG=$($AAPT dump badging "$APK" 2>/dev/null | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)
+  else
+    PKG=
+  fi
+fi
 if [[ -z "$PKG" ]]; then
-  echo "Cannot read package id with apkanalyzer" >&2
+  echo "Cannot read package id: install apkanalyzer or set AAPT=/path/to/aapt" >&2
   exit 1
 fi
 
@@ -42,7 +57,7 @@ run_mode() {
   local mode=$1
   $ADB shell am force-stop "$PKG" >/dev/null
   $ADB shell am start -n "$ACT" >/dev/null
-  $ADB shell "/data/local/tmp/eBPFDexDumper dump -n '$PKG' -o '$REMOTE/$mode' --no-clean-oat --probe-mode '$mode'"
+  $ADB shell su -c "/data/local/tmp/eBPFDexDumper dump -n '$PKG' -o '$REMOTE/$mode' --no-clean-oat --probe-mode '$mode'"
 }
 
 run_mode full || true
