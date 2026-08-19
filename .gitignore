@@ -1,5 +1,7 @@
 target/
 dist/
 .DS_Store
+__pycache__/
+*.py[cod]
 so/
 .claude

@@ -6,14 +6,17 @@
 
 [中文](../README.md) | English
 
-An authorized Android reverse-engineering tool for rooted ARM64 devices. It captures real DEX files from ART, records executed method bytecode, and restores it into dumped files. It also dumps runtime native `.so` images and recovers dynamically registered JNI names.
+An authorized Android reverse-engineering tool controlled from Windows, macOS, or Linux PCs. It captures real DEX files from ART on rooted ARM64 Android targets, records executed method bytecode, and restores it into dumped files. It also dumps runtime native `.so` images and recovers dynamically registered JNI names. The PC is the host; live capture still requires Android ART, root, and eBPF on the target.
 
 ## Quick start
 
 ```bash
 cargo build                # local debug build
 sh build_android.sh        # Android ARM64 release
+cargo ndk -t arm64-v8a build --release  # Windows/cross-platform (cargo-ndk + Android NDK)
 ```
+
+On a PC host, `cargo build` is suitable for offline `fix`, `fixso`, `offsets`, and DEX/ELF analysis. Live `dump`/`dumpso` still require the Android ARM64 release binary to run on the target.
 
 Push `target/aarch64-linux-android/release/eBPFDexDumper` to a rooted device with eBPF support:
 
@@ -72,13 +75,19 @@ sh build_android.sh
 
 ## Project skill
 
-The repository provides an [Android DEX dump skill](../skills/android-dex-dump/SKILL.md) that automates installing, launching, dumping, and validating a local APK:
+The repository provides a [PC Android DEX dump skill](../skills/android-dex-dump/SKILL.md) that automates installing, launching, dumping, and validating a local APK from Windows, macOS, or Linux:
 
 ```bash
 ./skills/android-dex-dump/scripts/run_dump.sh /path/to/app.apk
 ```
 
-The script tries `full → lifecycle → maps-only` in order and writes results plus `report.txt` to a new directory under Downloads. Use it only with APKs and devices you are authorized to test.
+On Windows PowerShell:
+
+```powershell
+.\skills\android-dex-dump\scripts\run_dump.ps1 C:\path\to\app.apk
+```
+
+Both wrappers call the same cross-platform `run_dump.py`, which tries `full → lifecycle → maps-only` in order and writes results plus `report.txt` to a new directory under the host's Downloads. The host needs Python 3.9+, ADB, and either `apkanalyzer` or Android SDK `aapt`; use only with APKs and devices you are authorized to test.
 
 ## License
 
