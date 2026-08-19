@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "ebpf-dex-dumper-rs"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "adler2",
  "anyhow",
